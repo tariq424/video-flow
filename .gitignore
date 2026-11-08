@@ -1,0 +1,24 @@
+# --- NEVER commit: signed-in Chrome profiles contain cookies/credentials ---
+profiles/
+
+# --- generated outputs ---
+output/
+__pycache__/
+*.pyc
+
+# --- remotion ---
+remotion/node_modules/
+remotion/public/
+remotion/storyboard_props.json
+remotion/.remotion/
+
+# --- media / runtime ---
+*.mp4
+*.mp3
+*.wav
+*.jpg
+*.jpeg
+*.png
+*.log
+flow_prompts*
+prompts.json
