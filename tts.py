@@ -15,6 +15,7 @@ Requires internet (Microsoft's TTS service).
 import asyncio
 import os
 import sys
+import json
 import time
 
 DEFAULT_VOICE = os.environ.get("FLOW_TTS_VOICE", "en-US-ChristopherNeural")
@@ -29,7 +30,10 @@ async def _save(text, voice, out_path):
 def synth(lines, out_mp3, voice=None):
     """Synthesize narration lines (joined with spaces) -> out_mp3.
     Retries once on failure (the TTS service drops connections now and then).
+    Writes a provenance sidecar (<out>.meta.json with the sha1 of the audio)
+    so the build can refuse a narration.mp3 that was swapped or is stale.
     -> the text that was spoken."""
+    import hashlib
     text = " ".join(l.strip() for l in lines if l and l.strip())
     if not text:
         raise RuntimeError("narration script is empty")
@@ -37,13 +41,20 @@ def synth(lines, out_mp3, voice=None):
     for attempt in (1, 2):
         try:
             asyncio.run(_save(text, voice or DEFAULT_VOICE, str(out_mp3)))
-            return text
+            break
         except Exception as e:
             last_err = e
             if attempt == 1:
                 print(f"TTS: {type(e).__name__} - retrying once in 5s ...", flush=True)
                 time.sleep(5)
-    raise last_err
+    if last_err is not None:
+        raise last_err
+    digest = hashlib.sha1(open(out_mp3, "rb").read()).hexdigest()
+    meta = {"sha1": digest, "chars": len(text), "voice": voice or DEFAULT_VOICE}
+    with open(str(out_mp3) + ".meta.json", "w", encoding="utf-8") as f:
+        json.dump(meta, f)
+    print(f"TTS: provenance sha1={digest[:12]} recorded", flush=True)
+    return text
 
 
 if __name__ == "__main__":

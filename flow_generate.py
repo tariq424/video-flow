@@ -191,10 +191,10 @@ def parse_prompts_text(text):
                 pending.append(narration)
             continue
         item = {"type": "image", "prompt": visual}
-        if pending:
-            item["narration"] = pending.pop(0)
-        if narration:
-            item["narration"] = narration
+        parts = pending + ([narration] if narration else [])
+        if parts:
+            item["narration"] = " ".join(parts)
+        pending = []
         items.append(item)
     return items
 
