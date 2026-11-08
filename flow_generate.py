@@ -24,6 +24,7 @@ import sys
 import time
 import json
 import shutil
+import hashlib
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -47,8 +48,30 @@ def check_only():
         pw.stop()
 
 
+def _prompt_hash(desc):
+    return hashlib.sha1(" ".join(desc.split()).lower().encode("utf-8")).hexdigest()[:16]
+
+
+def _load_meta(target):
+    p = Path(target) / "stills_meta.json"
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_meta(target, meta):
+    try:
+        Path(target).mkdir(parents=True, exist_ok=True)
+        (Path(target) / "stills_meta.json").write_text(
+            json.dumps(meta, indent=1), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def run_batch(prompts, target, skip_existing=False):
     saved, failed = [], []
+    meta = _load_meta(target)
     fa.log(f"batch: {len(prompts)} item(s) -> {target}")
     for i, item in enumerate(prompts, 1):
         kind = str(item.get("type", "")).strip().lower()
@@ -63,11 +86,16 @@ def run_batch(prompts, target, skip_existing=False):
         ext = "mp4" if kind == "video" else "jpg"
         dest = Path(target) / f"scene_{i:02d}.{ext}"
 
-        # resume mode (one-click pipeline): keep stills that already exist
+        # resume mode: keep an existing still ONLY if it was generated from
+        # the same prompt - a new script must regenerate, not reuse
         if skip_existing and dest.is_file():
-            fa.log(f"[{i:02d}] SKIP - {dest.name} already exists (resume mode)")
-            saved.append(i)
-            continue
+            rec = meta.get(dest.name) or {}
+            if rec.get("prompt_hash") == _prompt_hash(desc):
+                fa.log(f"[{i:02d}] SKIP - {dest.name} already exists (same prompt)")
+                saved.append(i)
+                continue
+            fa.log(f"[{i:02d}] REGENERATE - {dest.name} exists but was made "
+                   "from a different prompt")
 
         fa.log(f"[{i:02d}] Flow {kind} generation: {desc[:90]}{'...' if len(desc) > 90 else ''}")
 
@@ -86,6 +114,9 @@ def run_batch(prompts, target, skip_existing=False):
                     raise Blocker("saved file failed header validation (ftyp/JPEG/PNG)")
                 Path(target).mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(out, dest)
+                meta[dest.name] = {"prompt_hash": _prompt_hash(desc),
+                                   "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
+                _save_meta(target, meta)
                 fa.log(f"[{i:02d}] SAVED -> {dest} ({len(data) // 1024} KB)")
                 saved.append(i)
                 last_exc = None
