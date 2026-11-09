@@ -71,9 +71,29 @@ def _save_meta(target, meta):
         pass
 
 
+def _violated_path(target):
+    return Path(target) / "violated_prompts.json"
+
+
+def _load_violated(target):
+    try:
+        return json.loads(_violated_path(target).read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_violated(target, data):
+    try:
+        _violated_path(target).write_text(
+            json.dumps(data, indent=1), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def run_batch(prompts, target, skip_existing=False):
     saved, failed = [], []
     meta = _load_meta(target)
+    violated = _load_violated(target)
     total = len(prompts)
     fa.log(f"batch: {total} item(s) -> {target} (processed in groups of {BATCH_SIZE})")
     for i, item in enumerate(prompts, 1):
@@ -89,6 +109,28 @@ def run_batch(prompts, target, skip_existing=False):
         kind = str(item.get("type", "")).strip().lower()
         desc = str(item.get("prompt", "")).strip()
         aspect = str(item.get("aspect", "16:9")).strip()
+        narr = str(item.get("narration", "")).strip()
+
+        # Title:/Style: header lines are script metadata, not visuals - if the
+        # block carries narration, illustrate THAT instead of the header text
+        if desc and narr and re.match(r"(title|style)\s*:", desc, re.I):
+            desc = narr
+            fa.log(f"[{i:02d}] header line detected - illustrating the narration instead")
+        elif narr and not desc:
+            desc = "Documentary still, photorealistic, 16:9, cinematic lighting: " + narr
+            fa.log(f"[{i:02d}] no visual prompt - illustrating the narration instead")
+
+        # a prompt Flow refused for a policy violation is recorded permanently
+        # and NEVER repeated (same run, resume, or re-run)
+        ph = _prompt_hash(desc)
+        if ph in violated:
+            reason = violated[ph].get("reason", "violation")
+            fa.log(f"[{i:02d}] SKIPPED - Flow refused this prompt previously and it "
+                   f"is not being repeated ({reason[:100]}). Reword the prompt and "
+                   f"remove its entry from violated_prompts.json to retry.")
+            failed.append((i, "previously refused by Flow (violation) - not repeated"))
+            continue
+
         if kind not in ("image", "video") or not desc:
             fa.log(f"[{i:02d}] SKIPPED - needs \"type\" (image|video) and visual prompt "
                    f"lines (a NARRATION:-only block has no image): {json.dumps(item)[:120]}")
@@ -136,6 +178,13 @@ def run_batch(prompts, target, skip_existing=False):
             except Exception as e:                   # keep the batch going
                 last_exc = e
                 msg = str(e)
+                # a Flow policy refusal is recorded permanently - that exact
+                # prompt is never sent again (this run, resume, or re-run)
+                if "Flow refused this prompt" in msg or "session says" in msg:
+                    violated[ph] = {"prompt": desc[:200],
+                                    "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                    "reason": msg[:300]}
+                    _save_violated(target, violated)
                 # "typed but not sent" / composer issues are transient Flow UI
                 # timing - one immediate second attempt is worth the time
                 if attempt == 1 and ("not sent" in msg or "composer" in msg):
