@@ -33,6 +33,8 @@ import flow_automation as fa                      # noqa: E402
 from flow_automation import Blocker               # noqa: E402
 
 DEFAULT_TARGET = Path(os.environ.get("FLOW_TARGET_DIR") or r"F:\videos\google-flow-videos")
+BATCH_SIZE = 10   # long scripts are processed in groups of this many items,
+                  # with a rest + busy-monitor checkpoint between groups
 
 
 def check_only():
@@ -72,8 +74,18 @@ def _save_meta(target, meta):
 def run_batch(prompts, target, skip_existing=False):
     saved, failed = [], []
     meta = _load_meta(target)
-    fa.log(f"batch: {len(prompts)} item(s) -> {target}")
+    total = len(prompts)
+    fa.log(f"batch: {total} item(s) -> {target} (processed in groups of {BATCH_SIZE})")
     for i, item in enumerate(prompts, 1):
+        # group checkpoint: between groups of BATCH_SIZE, cool down and make
+        # sure no other automation has started driving Flow
+        if i > 1 and (i - 1) % BATCH_SIZE == 0:
+            fa.log(f"batch checkpoint: {i - 1} of {total} done - resting 30s before "
+                   f"items {i}-{min(i + BATCH_SIZE - 1, total)} ...")
+            time.sleep(30)
+            if not fa.wait_until_flow_free():
+                failed.append((i, "Flow still busy - batch stopped here"))
+                break
         kind = str(item.get("type", "")).strip().lower()
         desc = str(item.get("prompt", "")).strip()
         aspect = str(item.get("aspect", "16:9")).strip()
