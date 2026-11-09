@@ -481,7 +481,49 @@ def send_prompt(page, text):
         page.wait_for_timeout(2500)
     if left():
         raise Blocker("prompt typed but not sent (Enter + send arrow ignored 12 tries)")
-    log("prompt sent")
+
+    # The composer can ALSO clear on a frame re-render without submitting
+    # anything (seen live: "prompt sent" logged while the session stayed
+    # empty). Verify the prompt actually landed in the session before
+    # trusting it; if not, re-type and re-send.
+    probe = re.sub(r"\s+", " ", text).strip().lower()[:45]
+    page.wait_for_timeout(3000)
+
+    def session_has_prompt():
+        for fr in page.frames:
+            try:
+                if probe and probe in fr.locator("body").inner_text().lower():
+                    return True
+            except Exception:
+                continue
+        return False
+
+    for resend in range(2):
+        if session_has_prompt():
+            break
+        log(f"composer cleared but the session shows no prompt - re-typing "
+            f"and re-sending (attempt {resend + 2}) ...")
+        try:
+            comp = box_frame.locator(
+                "textarea, [contenteditable='true'], [role='textbox']").first
+            comp.click(timeout=3000)
+            comp.fill(text)
+            comp.press("Enter")
+        except Exception:
+            pass
+        for sel in SEND_BUTTON_SELECTORS:
+            try:
+                b = box_frame.locator(sel).last
+                if b.is_visible(timeout=600) and b.is_enabled():
+                    b.click(timeout=4000)
+                    break
+            except Exception:
+                continue
+        page.wait_for_timeout(2500)
+    if not session_has_prompt():
+        raise Blocker("prompt send did not land in the session (verified - "
+                      "composer cleared with no submission)")
+    log("prompt sent (session-verified)")
     return box_frame
 
 
@@ -555,18 +597,47 @@ def _save(data, name):
     return p
 
 
+_REFUSAL_MARKERS = ("violate", "violation", "content policy", "flagged", "rejected",
+                    "couldn't generate", "could not generate", "unable to generate",
+                    "wasn't created", "was not created", "didn't work", "did not work",
+                    "try a different prompt", "try again with a different")
+
+
+def _session_refusal(page, our_text):
+    """Quoted Flow refusal text when the session shows a generation rejection.
+    Our own prompt text is stripped first so script words like 'violation'
+    (documentary narration about war crimes) can't false-positive."""
+    for fr in page.frames:
+        try:
+            txt = fr.locator("body").inner_text()
+        except Exception:
+            continue
+        if our_text:
+            txt = txt.replace(our_text, " ")
+        low = txt.lower()
+        for marker in _REFUSAL_MARKERS:
+            i = low.find(marker)
+            if i != -1:
+                return "... " + txt[max(0, i - 120): i + 180].strip().replace("\n", " ") + " ..."
+    return None
+
+
 # ----------------------------------------------------------------- generation
 def _generate_video(ctx, page, desc, aspect):
     """r8 logic: prompt a short video, approve the quote once, poll <=480s."""
     del aspect                                    # Flow picks the clip shape itself
+    sent_text = _prompt_text(desc, "cinematic slow camera move, photorealistic, no text")
     close_news(page)
-    box_frame = send_prompt(page, _prompt_text(desc, "cinematic slow camera move, photorealistic, no text"))
+    box_frame = send_prompt(page, sent_text)
     before = set(frames_videos(page))
 
     approved, vidsrc = False, ""
     t0 = time.time()
-    while time.time() - t0 < 480 and not vidsrc:  # Flow queues at busy times
+    while time.time() - t0 < 480 and not vidsrc:          # Flow queues at busy times
         page.wait_for_timeout(5000 if not approved else 15000)
+        refusal = _session_refusal(page, sent_text)
+        if refusal:
+            raise Blocker("Flow refused this prompt - session says: " + refusal)
         if not approved:
             fr, cost = quote(page)
             if fr is not None:
@@ -610,13 +681,17 @@ def _generate_video(ctx, page, desc, aspect):
 def _generate_image(ctx, page, desc, aspect):
     """r14 logic: ask for ONE still, approve ONLY at 0 credits, poll <=300s."""
     shape = "Tall vertical 9:16 portrait image." if aspect == "9:16" else "Wide horizontal 16:9 landscape image."
+    sent_text = IMAGE_ASK.format(shape=shape, desc=str(desc)[:1200])
     before = set(frames_imgs(page))
-    send_prompt(page, IMAGE_ASK.format(shape=shape, desc=str(desc)[:1200]))
+    send_prompt(page, sent_text)
 
     src, handled = "", False
     t0 = time.time()
     while time.time() - t0 < 300 and not src:
         page.wait_for_timeout(5000)
+        refusal = _session_refusal(page, sent_text)
+        if refusal:
+            raise Blocker("Flow refused this prompt - session says: " + refusal)
         if not handled:
             fr, cost = quote(page)
             if fr is not None:
