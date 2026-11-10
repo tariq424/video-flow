@@ -158,20 +158,30 @@ def run_batch(prompts, target, skip_existing=False):
             failed.append((i, "Flow still busy - batch stopped here"))
             break
 
+        # generation ladder: original prompt -> documentary-safe rewrite ->
+        # neutral symbolic still (the last rung only when Flow refuses the
+        # prompt for policy). The still that lands is spliced into the video;
+        # its provenance records the ORIGINAL prompt hash so resume stays
+        # consistent, and refusals are remembered so they're never repeated.
+        variants = [desc]
+        vi = 0
         last_exc = None
-        for attempt in (1, 2):
+        while vi < len(variants):
+            sent_desc = variants[vi]
+            vi += 1
             try:
-                out = fa.generate(desc, kind, aspect)
+                out = fa.generate(sent_desc, kind, aspect)
                 data = Path(out).read_bytes()
                 valid = fa.is_video(data) if kind == "video" else fa.is_image(data)
                 if not valid:
                     raise Blocker("saved file failed header validation (ftyp/JPEG/PNG)")
                 Path(target).mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(out, dest)
-                meta[dest.name] = {"prompt_hash": _prompt_hash(desc),
+                meta[dest.name] = {"prompt_hash": ph,
                                    "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
                 _save_meta(target, meta)
-                fa.log(f"[{i:02d}] SAVED -> {dest} ({len(data) // 1024} KB)")
+                fa.log(f"[{i:02d}] SAVED -> {dest} ({len(data) // 1024} KB)"
+                       + (" (documentary-safe rewrite)" if vi > 1 else ""))
                 saved.append(i)
                 last_exc = None
                 break
@@ -185,10 +195,16 @@ def run_batch(prompts, target, skip_existing=False):
                                     "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
                                     "reason": msg[:300]}
                     _save_violated(target, violated)
-                # "typed but not sent" / composer issues are transient Flow UI
-                # timing - one immediate second attempt is worth the time
-                if attempt == 1 and ("not sent" in msg or "composer" in msg):
-                    fa.log(f"[{i:02d}] transient Flow UI failure - retrying once in 5s ...")
+                    if vi >= len(variants):
+                        rewritten = fa.sanitize_prompt(variants[-1])
+                        if rewritten.lower() != variants[-1].lower() and rewritten.strip():
+                            variants.append(rewritten)
+                            fa.log(f"[{i:02d}] Flow refused this prompt - retrying with "
+                                   f"a documentary-safe rewrite ...")
+                        else:
+                            variants.append(fa.neutral_prompt())
+                            fa.log(f"[{i:02d}] Flow refused this prompt - retrying with "
+                                   f"a neutral symbolic still ...")
                     time.sleep(5)
                     continue
                 break
