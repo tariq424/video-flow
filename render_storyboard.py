@@ -113,14 +113,24 @@ def render_storyboard(scenes, out_mp4, width=1920, height=1080, fps=30, fade_s=0
     cmd = [_npx(), "remotion", "render", "src/index.jsx", "Storyboard",
            str(out_mp4), "--props", str(props_file), "--jpeg"]
     print("Remotion:", " ".join(cmd), flush=True)
-    # Two known failure shapes, handled differently:
+    # Three failure shapes, handled differently:
+    #   - stale output from a PREVIOUS render still on disk -> delete it
+    #     BEFORE rendering; the flush recovery must never mistake it for
+    #     this attempt's work (that once muxed old visuals with new audio)
     #   - browser start flake (fails fast, no usable file) -> retry
     #   - long-render flush error (EVERY frame rendered and encoded, file
-    #     complete, exit 1 at cleanup) -> do NOT re-render an 8-minute
-    #     timeline; validate the file and proceed
+    #     complete and fresh, exit 1 at cleanup) -> validate & proceed
+    if out_mp4.exists():
+        try:
+            out_mp4.unlink()
+            print(f"removed stale {out_mp4.name} before rendering", flush=True)
+        except OSError as e:
+            print(f"could not remove stale {out_mp4.name} ({e})", flush=True)
+
     expected_s = sum(s.get("duration", 0) for s in scenes)
+    render_started = time.time()
     last_err = None
-    for attempt, backoff in ((1, 8), (2, 25)):
+    for attempt, backoff in ((1, 8), (2, 25), (3, 60), (4, 120)):
         try:
             proc = subprocess.run(cmd, cwd=str(REMOTION_DIR))
             rc = proc.returncode
@@ -129,10 +139,11 @@ def render_storyboard(scenes, out_mp4, width=1920, height=1080, fps=30, fade_s=0
             # a non-zero exit - validate whatever output exists, then retry
             print(f"Remotion launch failed ({type(e).__name__}: {str(e)[:120]})", flush=True)
             rc = -1
-        if rc == 0 and out_mp4.is_file():
+        fresh = out_mp4.is_file() and out_mp4.stat().st_mtime >= render_started - 1
+        if rc == 0 and fresh:
             last_err = None
             break
-        if _output_valid(out_mp4, expected_s):
+        if rc != 0 and fresh and _output_valid(out_mp4, expected_s):
             print("Remotion threw exit %s, but output file exists and looks valid. "
                   "Proceeding..." % rc, flush=True)
             last_err = None
@@ -142,7 +153,7 @@ def render_storyboard(scenes, out_mp4, width=1920, height=1080, fps=30, fade_s=0
               "(browser start can flake after browser-heavy steps) ...", flush=True)
         time.sleep(backoff)
     if last_err is not None:
-        raise RuntimeError(f"Remotion render failed ({last_err}, after 3 attempts)")
+        raise RuntimeError(f"Remotion render failed ({last_err}, after 4 attempts)")
     print(f"Remotion render done -> {out_mp4} ({out_mp4.stat().st_size // 1024} KB)", flush=True)
     return out_mp4
 
