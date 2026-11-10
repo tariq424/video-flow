@@ -666,7 +666,9 @@ def neutral_prompt():
 _REFUSAL_MARKERS = ("violate", "violation", "content policy", "flagged", "rejected",
                     "couldn't generate", "could not generate", "unable to generate",
                     "wasn't created", "was not created", "didn't work", "did not work",
-                    "try a different prompt", "try again with a different")
+                    "try a different prompt", "try again with a different",
+                    "unusual activity", "may cause issues", "suspicious activity",
+                    "rate limit", "too many requests")
 
 
 def _session_refusal(page, our_text):

@@ -225,6 +225,12 @@ def run_batch(prompts, target, skip_existing=False):
                 fa.log(f"[{i:02d}] FAILED - {type(last_exc).__name__}: {str(last_exc)[:200]}")
                 failed.append((i, f"{type(last_exc).__name__}: {str(last_exc)[:160]}"))
 
+        # pacing cooldown after every GENERATED item: back-to-back browser
+        # sessions are what tripped Google's unusual-activity detection
+        if saved or failed:
+            fa.log(f"[{i:02d}] pacing cooldown 45s before the next generation ...")
+            time.sleep(45)
+
     fa.log("")
     fa.log(f"=== Flow batch summary: {len(saved)} saved, {len(failed)} failed/skipped ===")
     for i, why in failed:
