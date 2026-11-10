@@ -445,11 +445,18 @@ def send_prompt(page, text):
                     cand = loc.nth(i)
                     try:
                         cand.click(timeout=3000)      # drive INSIDE the frame
-                        cand.fill(text)
+                        # TYPE with real keystrokes: Flow's React composer does
+                        # not register programmatic fill on current builds - the
+                        # text shows visually but the internal state stays
+                        # empty, so Enter submits nothing and the composer
+                        # clears. Keystrokes fire the events React needs.
+                        try:
+                            page.keyboard.type(text, delay=20)
+                        except Exception:
+                            cand.fill(text)           # fallback
                         page.wait_for_timeout(1200)   # a re-render may wipe it
                         if not _composer_text(cand):
-                            cand.fill(text)           # wiped once - fill again
-                            page.wait_for_timeout(800)
+                            page.keyboard.type(text, delay=20)  # wiped - type again
                         box, box_frame = cand, fr
                         break
                     except Exception:
@@ -525,7 +532,7 @@ def send_prompt(page, text):
             comp = box_frame.locator(
                 "textarea, [contenteditable='true'], [role='textbox']").first
             comp.click(timeout=3000)
-            comp.fill(text)
+            page.keyboard.type(text, delay=20)
             comp.press("Enter")
         except Exception:
             pass
