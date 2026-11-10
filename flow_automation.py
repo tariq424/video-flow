@@ -402,9 +402,19 @@ def _frame_tag(fr):
     return fr.url.split("/")[-1][:50] or fr.name[:30] or "main"
 
 
+def _composer_text(locator):
+    """The visible text/value of a composer element ('' when unreadable)."""
+    try:
+        if locator.evaluate("e => 'value' in e"):
+            return (locator.input_value() or "").strip()
+        return (locator.inner_text() or "").strip()
+    except Exception:
+        return ""
+
+
 def send_prompt(page, text):
     """New project -> the composer inside its frame -> type -> send (Enter, then
-    the send arrow retried 8x). -> the composer's frame. Raises Blocker."""
+    the send arrow retried 12x). -> the composer's frame. Raises Blocker."""
     close_news(page)
     newproj = _pick(page, ["button:has-text('New project')", ":text('New project')", "button:has-text('add')"])
     try:
@@ -412,10 +422,14 @@ def send_prompt(page, text):
         log("clicked New project (the landing page has no composer)")
     except Exception:
         raise Blocker("'New project' button not found/clickable")
-    page.wait_for_timeout(8000)
+    # Flow's agent writes a welcome message right after the editor mounts and
+    # RE-RENDERS the composer while doing it - text typed during that window
+    # gets wiped before it can be submitted. Give the greeting time to finish.
+    page.wait_for_timeout(15000)
     close_news(page)
 
-    # find and drive the composer INSIDE its frame
+    # find and drive the composer INSIDE its frame; after filling, verify the
+    # text SURVIVED (a re-render wipes it) and re-fill if it was eaten
     inv, box, box_frame = [], None, None
     for fr in page.frames:
         ta = fr.locator("textarea")
@@ -432,6 +446,10 @@ def send_prompt(page, text):
                     try:
                         cand.click(timeout=3000)      # drive INSIDE the frame
                         cand.fill(text)
+                        page.wait_for_timeout(1200)   # a re-render may wipe it
+                        if not _composer_text(cand):
+                            cand.fill(text)           # wiped once - fill again
+                            page.wait_for_timeout(800)
                         box, box_frame = cand, fr
                         break
                     except Exception:
