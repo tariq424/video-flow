@@ -36,6 +36,7 @@ import json
 import time
 import random
 import base64
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -179,6 +180,78 @@ def open_browser(headless=False, onscreen=True):
     page = ctx.new_page()
     page.set_default_timeout(20000)
     return pw, ctx, page
+
+
+CDP_PORT = int(os.environ.get("FLOW_CDP_PORT", "9222"))
+CDP_URL = f"http://127.0.0.1:{CDP_PORT}"
+
+
+def _find_chrome():
+    for p in (r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+              r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+              str(Path.home() / "AppData" / "Local" / "Google" / "Chrome" / "Application" / "chrome.exe")):
+        if Path(p).is_file():
+            return p
+    found = shutil.which("chrome") or shutil.which("chrome.exe")
+    return found
+
+
+def cdp_alive(timeout_s=3):
+    """True when a Chrome with our CDP port is already running."""
+    try:
+        requests.get(CDP_URL + "/json/version", timeout=timeout_s)
+        return True
+    except Exception:
+        return False
+
+
+def attach_or_launch(onscreen=True):
+    """Attach to the manual-assist browser - a real Chrome on OUR profile with
+    a CDP debug port - or launch it fresh. Returns (pw, ctx, page).
+
+    Unlike open_browser(), the caller must NOT close/stop the result when the
+    browser should stay open for the user to work in (manual paste). A
+    CDP-attached browser is not a Playwright child, so it survives process
+    exit regardless."""
+    from playwright.sync_api import sync_playwright
+    if cdp_alive():
+        pw = sync_playwright().start()
+        ctx = pw.chromium.connect_over_cdp(CDP_URL)
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        page.set_default_timeout(20000)
+        log(f"attached to the running manual-assist browser (CDP :{CDP_PORT})")
+        return pw, ctx, page
+
+    chrome = _find_chrome()
+    if not chrome:
+        raise Blocker("Google Chrome not found - install Chrome or use open_browser()")
+    repair_prefs(PROFILE_DIR)   # must run while Chrome is NOT holding the profile
+    args = ["--lang=en-US", "--hide-crash-restore-bubble", "--no-default-browser-check",
+            "--no-first-run", "--disable-sync", "--disable-blink-features=AutomationControlled",
+            "--disable-features=SigninInterception,ChromeSigninInterception,ExplicitBrowserSigninUIOnDesktop",
+            f"--remote-debugging-port={CDP_PORT}", f"--user-data-dir={PROFILE_DIR}",
+            f"--window-position={80 if onscreen else -32000},80", "--window-size=1440,1000",
+            "about:blank"]
+    subprocess.Popen([chrome] + args,
+                     creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
+    t0 = time.time()
+    while not cdp_alive(timeout_s=1) and time.time() - t0 < 30:
+        time.sleep(0.5)
+    if not cdp_alive():
+        raise Blocker(f"Chrome did not expose CDP on port {CDP_PORT} within 30s")
+    pw = sync_playwright().start()
+    ctx = pw.chromium.connect_over_cdp(CDP_URL)
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    page.set_default_timeout(20000)
+    log(f"launched the manual-assist browser on OUR profile (CDP :{CDP_PORT}) - "
+        "it stays open for you; do not close it until the stills are imported")
+    return pw, ctx, page
+
+
+def frames_imgs_snapshot(page):
+    """The image srcs currently visible in the project, in DOM order, as a
+    JSON-safe list - the baseline a manual import diffs against."""
+    return list(frames_imgs(page))
 
 
 def goto(page, url, wait="domcontentloaded"):

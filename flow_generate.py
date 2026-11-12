@@ -91,10 +91,196 @@ def _save_violated(target, data):
         pass
 
 
-def run_batch_agent(prompts, target):
+def _manual_scenes(prompts, target, skip_existing=True):
+    """The scenes the manual batch must generate: sanitized exactly like
+    run_batch (same header-line / narration-only / sanitize order), optionally
+    limited to scenes whose still is missing or made from a different prompt.
+    Returns [{"n", "prompt", "narration", "hash"}, ...]."""
+    meta = _load_meta(target)
+    out = []
+    for i, it in enumerate(prompts, 1):
+        desc = str(it.get("prompt", "")).strip()
+        narr = str(it.get("narration", "")).strip()
+        if desc and narr and re.match(r"(title|style)\s*:", desc, re.I):
+            desc = narr
+        elif narr and not desc:
+            desc = "Documentary still, photorealistic, 16:9, cinematic lighting: " + narr
+        if not desc:
+            continue
+        desc = fa.sanitize_prompt(desc)
+        ph = _prompt_hash(desc)
+        dest = Path(target) / f"scene_{i:02d}.jpg"
+        if skip_existing and dest.is_file() and (meta.get(dest.name) or {}).get("prompt_hash") == ph:
+            fa.log(f"[{i:02d}] SKIP - {dest.name} already exists (same prompt)")
+            continue
+        out.append({"n": i, "prompt": desc, "narration": narr, "hash": ph})
+    return out
+
+
+def _batch_text(scenes):
+    """The exact text agent_batch_generate would send - one Agent submission
+    covering every scene, ready for a human to paste into Flow."""
+    text = fa.AGENT_BATCH_PREAMBLE + "\n\n"
+    for s in scenes:
+        text += f"Scene {s['n']}: {s['prompt']}\n"
+        if s.get("narration"):
+            text += f"NARRATION: {s['narration']}\n"
+        text += "\n"
+    return text
+
+
+def _copy_to_clipboard(text):
+    try:
+        import tkinter
+        r = tkinter.Tk()
+        r.withdraw()
+        r.clipboard_clear()
+        r.clipboard_append(text)
+        r.update_idletasks()
+        r.update()
+        r.destroy()
+        return True
+    except Exception as e:
+        fa.log(f"clipboard copy failed ({type(e).__name__}: {str(e)[:80]}) - "
+               "the batch text is still on disk")
+        return False
+
+
+def prepare_batch(prompts, target):
+    """Manual-assist step 1: build the Flow Agent batch for the scenes that
+    still need stills, write agent_batch.txt next to the target and copy it to
+    the clipboard. The user pastes it into the Flow composer themselves -
+    human-paste submissions do not trip Google's automation guard."""
+    scenes = _manual_scenes(prompts, target, skip_existing=True)
+    if not scenes:
+        fa.log("manual batch: every scene already has a fresh still - nothing to generate")
+        return False
+    out = Path(target)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "agent_batch.txt").write_text(_batch_text(scenes), encoding="utf-8")
+    (out / "scenes_todo.json").write_text(
+        json.dumps([{"n": s["n"], "hash": s["hash"]} for s in scenes], indent=1),
+        encoding="utf-8")
+    _copy_to_clipboard(_batch_text(scenes))
+    fa.log(f"manual batch ready: {len(scenes)} scene(s) -> {out / 'agent_batch.txt'} "
+           "(also copied to the clipboard)")
+    return True
+
+
+def open_project_session(target):
+    """Manual-assist step 2: open/attach the REAL browser window on our Flow
+    profile, run the sign-in gate, and record the images currently visible as
+    the import baseline. Leaves the browser OPEN for the user to paste into."""
+    todo_path = Path(target) / "scenes_todo.json"
+    if not todo_path.is_file():
+        fa.log("no scenes_todo.json - run --prepare-batch first")
+        return False
+    todo = json.loads(todo_path.read_text(encoding="utf-8"))
+    url = fa.PROJECT_URL or fa.FLOW_HOME
+    pw, ctx, page = fa.attach_or_launch()
+    try:
+        fa.goto(page, url)
+    except Exception as e:
+        fa.log(f"navigation issue ({str(e)[:100]}) - the browser window is still open")
+    try:
+        if fa.run_gate(page):
+            fa.log("signed in - ready for your paste")
+        else:
+            fa.log("sign-in not confirmed - complete it INSIDE the opened window if asked")
+    except Exception as e:
+        fa.log(f"gate check skipped ({str(e)[:80]})")
+    try:
+        page.bring_to_front()
+    except Exception:
+        pass
+    baseline = {"url": url, "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "todo": todo, "srcs": fa.frames_imgs_snapshot(page)}
+    Path(target).mkdir(parents=True, exist_ok=True)
+    (Path(target) / "import_baseline.json").write_text(
+        json.dumps(baseline, indent=1), encoding="utf-8")
+    fa.log("")
+    fa.log("=" * 62)
+    fa.log(f"MANUAL STEP - in the Flow window that just opened:")
+    fa.log(f"  1. click into the composer, paste (Ctrl+V) and send")
+    fa.log(f"     ({len(todo)} scene(s) are already on your clipboard)")
+    fa.log(f"  2. wait until every scene image has finished generating")
+    fa.log(f"  3. then click 'Import Flow stills' here in the builder")
+    fa.log("=" * 62)
+    # deliberately NO ctx.close()/pw.stop(): the browser stays for the paste
+    return True
+
+
+def import_batch(prompts, target):
+    """Manual-assist step 3: diff the Flow window's images against the import
+    baseline, download the new ones in DOM (chronological) order and map them
+    to the prepared scene numbers. On a count mismatch nothing is mapped
+    (order would be guesswork) - the user generates the rest and re-imports."""
+    base_path = Path(target) / "import_baseline.json"
+    if not base_path.is_file():
+        fa.log("no import_baseline.json - run --prepare-batch and --open-project first")
+        return False
+    base = json.loads(base_path.read_text(encoding="utf-8"))
+    todo = base.get("todo") or []
+    if not fa.cdp_alive():
+        fa.log("the manual-assist browser is closed - run --open-project again, "
+               "paste the batch, and import before closing it")
+        return False
+    pw, ctx, page = fa.attach_or_launch()
+    try:
+        url = base.get("url") or (fa.PROJECT_URL or fa.FLOW_HOME)
+        fa.goto(page, url)
+        if not fa.run_gate(page):
+            fa.log("sign-in not confirmed - complete it inside the window and re-run import")
+            return False
+        before = set(base.get("srcs") or [])
+        new_srcs = [s for s in fa.frames_imgs(page) if s not in before]
+        fa.log(f"import: {len(new_srcs)} new image(s) found "
+               f"({len(todo)} expected)")
+        if len(new_srcs) < len(todo):
+            fa.log(f"IMPORT INCOMPLETE: {len(todo) - len(new_srcs)} scene image(s) "
+                   f"still missing - let Flow finish (or regenerate the missing "
+                   f"ones) and click 'Import Flow stills' again. Nothing was mapped.")
+            return False
+        if len(new_srcs) > len(todo):
+            fa.log("more new images than expected - mapping the FIRST "
+                   f"{len(todo)} in order (extra images stay in Flow)")
+            new_srcs = new_srcs[:len(todo)]
+
+        target_path = Path(target)
+        target_path.mkdir(parents=True, exist_ok=True)
+        meta = _load_meta(target_path)
+        for s, src in zip(todo, new_srcs):
+            n, ph = s["n"], s["hash"]
+            data = fa._download(src, ctx, page, "image")
+            if not data or not fa.is_image(data):
+                fa.log(f"[{n:02d}] FAILED - download failed or not a valid image "
+                       f"({str(src)[:70]})")
+                continue
+            dest = target_path / f"scene_{n:02d}.jpg"
+            dest.write_bytes(data)
+            meta[dest.name] = {"prompt_hash": ph,
+                               "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
+            fa.log(f"[{n:02d}] SAVED -> {dest} ({len(data) // 1024} KB)")
+        _save_meta(target_path, meta)
+        saved, missing = [], []
+        for s in todo:
+            rec = meta.get(f"scene_{s['n']:02d}.jpg") or {}
+            (saved if rec.get("prompt_hash") == s["hash"] else missing).append(s["n"])
+        if missing:
+            fa.log(f"VALIDATION: scene(s) still missing after import: {missing}")
+            return False
+        fa.log(f"VALIDATION PASSED: {len(saved)} scene(s) imported with provenance")
+        return True
+    finally:
+        # keep the window open - the user may need to re-import
+        pass
+
+
+def run_batch_agent(prompts, target, ctx=None, page=None):
     """Agent batch mode: ONE Flow Agent submission generates all scene stills,
     which are then mapped to scene_NN.jpg by submission order. Missing beats
-    fall back to stock sources (Bing, Openverse). Returns True on success."""
+    fall back to stock sources (Bing, Openverse). Returns True on success.
+    ctx/page may be passed in by a caller that already opened the browser."""
     scenes = []
     for i, it in enumerate(prompts, 1):
         p = (it.get('prompt') or '').strip()
@@ -106,9 +292,12 @@ def run_batch_agent(prompts, target):
         return False
 
     fa.log(f"agent batch: {len(scenes)} scene prompt(s) in ONE Flow Agent submission")
-    pw, ctx, page = fa.open_browser()
+    own_browser = ctx is None or page is None
     saved_paths = []
+    pw = None
     try:
+        if own_browser:
+            pw, ctx, page = fa.open_browser()
         fa.goto(page, fa.FLOW_HOME)
         if not fa.run_gate(page):
             raise fa.Blocker("gate failed (signed out / CAPTCHA / unknown state)")
@@ -121,21 +310,25 @@ def run_batch_agent(prompts, target):
         fa.log(f"agent batch FAILED - {type(e).__name__}: {str(e)[:200]}")
         return False
     finally:
-        try:
-            ctx.close()
-            pw.stop()
-        except Exception:
-            pass
+        if own_browser:
+            try:
+                ctx.close()
+                pw.stop()
+            except Exception:
+                pass
 
     # map the batch images to scene_NN.jpg in submission order
     target_path = Path(target)
     target_path.mkdir(parents=True, exist_ok=True)
+    meta = _load_meta(target_path)
+    saved = []
     for i, src_path in enumerate(saved_paths, 1):
         dest = target_path / f"scene_{i:02d}.jpg"
         shutil.copyfile(src_path, dest)
         meta[dest.name] = {"prompt_hash": _prompt_hash(scenes[i - 1]['prompt']),
                            "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
         fa.log(f"[{i:02d}] SAVED -> {dest}")
+        saved.append(i)
     _save_meta(target_path, meta)
 
     # validation: the expected count vs the actual
@@ -396,7 +589,8 @@ def main():
 
 
     if not argv:
-        fa.log("usage: python flow_generate.py <prompts.json> [--target DIR] | --check")
+        fa.log("usage: python flow_generate.py <prompts.json> [--target DIR] | --check | "
+               "--prepare-batch | --open-project | --import-batch")
         sys.exit(1)
     prompts_file = Path(argv[0])
     try:
@@ -417,6 +611,16 @@ def main():
     if not isinstance(prompts, list) or not prompts:
         fa.log("FAILED - prompts file must be a non-empty JSON list or a .txt with prompts.")
         sys.exit(1)
+
+    # ---- manual-assist workflow (paste-proof against Google's automation
+    # guard): the factory prepares the batch, the human pastes and sends it in
+    # the REAL browser window, the factory imports the finished stills.
+    if "--prepare-batch" in argv:
+        sys.exit(0 if prepare_batch(prompts, target) else 1)
+    if "--open-project" in argv:
+        sys.exit(0 if open_project_session(target) else 1)
+    if "--import-batch" in argv:
+        sys.exit(0 if import_batch(prompts, target) else 1)
 
     if "--agent-batch" in argv:
         # programmatic Agent batch: ONE submission generates all scene stills
