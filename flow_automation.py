@@ -51,6 +51,10 @@ BUSY_MARKERS = [m for m in os.environ.get(
 
 FLOW_HOME = "https://flow.google.com/"
 
+# Optional: pin batches to a specific Flow project (its /project/<id> URL).
+# Set via the FLOW_PROJECT_URL env var; empty = create a New project per batch.
+PROJECT_URL = os.environ.get("FLOW_PROJECT_URL", "")
+
 # Strong signed-out evidence: Google's sign-in hosts, or the /about marketing
 # page (signed-out flow.google.com redirects there).
 WALL_URL_MARKERS = ("accounts.google.com/SignIn", "accounts.google.com/ServiceLogin",
@@ -883,12 +887,16 @@ def agent_batch_generate(ctx, page, scenes, poll_s=2700):
         sent_text += "\n"
 
     close_news(page)
-    newproj = _pick(page, ["button:has-text('New project')", ":text('New project')", "button:has-text('add')"])
-    try:
-        newproj.first.click(timeout=10000)
-        log("clicked New project for the batch")
-    except Exception:
-        raise Blocker("'New project' button not found/clickable")
+    if PROJECT_URL:
+        goto(page, PROJECT_URL)
+        log(f"using the pinned project: {PROJECT_URL}")
+    else:
+        newproj = _pick(page, ["button:has-text('New project')", ":text('New project')", "button:has-text('add')"])
+        try:
+            newproj.first.click(timeout=10000)
+            log("clicked New project for the batch")
+        except Exception:
+            raise Blocker("'New project' button not found/clickable")
     # the agent greeting race: give it time to finish before typing
     page.wait_for_timeout(15000)
     close_news(page)
