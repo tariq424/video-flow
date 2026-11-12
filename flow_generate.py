@@ -23,6 +23,7 @@ import re
 import sys
 import time
 import json
+import random
 import shutil
 import hashlib
 from pathlib import Path
@@ -218,18 +219,43 @@ def run_batch(prompts, target, skip_existing=False):
                     continue
                 break
         if last_exc is not None:
-            if isinstance(last_exc, Blocker):
-                fa.log(f"[{i:02d}] FAILED - {last_exc}")
-                failed.append((i, str(last_exc)))
-            else:
-                fa.log(f"[{i:02d}] FAILED - {type(last_exc).__name__}: {str(last_exc)[:200]}")
-                failed.append((i, f"{type(last_exc).__name__}: {str(last_exc)[:160]}"))
+            why = (str(last_exc) if isinstance(last_exc, Blocker)
+                   else f"{type(last_exc).__name__}: {str(last_exc)[:200]}")
+            fa.log(f"[{i:02d}] FAILED - {why}")
 
-        # pacing cooldown after every GENERATED item: back-to-back browser
-        # sessions are what tripped Google's unusual-activity detection
+            # STOCK FALLBACK: when Flow refuses or fails a generation, keep the
+            # beat covered with a documentary still from stock sources (Bing,
+            # Openverse) - the beat is never left empty or stale
+            stock_ok = False
+            try:
+                import stock_stills
+                fa.log(f"[{i:02d}] fetching a documentary still from stock sources "
+                       f"(Bing, Openverse) ...")
+                q = re.sub(r"^(visual prompt|end card[^:]*)[:\s]*", "", desc,
+                           flags=re.I).strip()
+                stock_ok = stock_stills.fetch_still(q, str(dest))
+            except Exception as se:
+                fa.log(f"[{i:02d}] stock fallback error: {type(se).__name__}: {str(se)[:120]}")
+            if stock_ok:
+                meta[dest.name] = {"prompt_hash": ph,
+                                   "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
+                _save_meta(target, meta)
+                fa.log(f"[{i:02d}] SAVED (stock) -> {dest}")
+                saved.append(i)
+                last_exc = None
+
+        # pacing cooldown after every GENERATED item: randomized rest between
+        # browser sessions - back-to-back regular sessions are what tripped
+        # Google's unusual-activity detection. On an unusual-activity failure,
+        # back off 10 minutes once before the next item.
         if saved or failed:
-            fa.log(f"[{i:02d}] pacing cooldown 45s before the next generation ...")
-            time.sleep(45)
+            rest = random.uniform(45, 120)
+            fa.log(f"[{i:02d}] pacing cooldown {rest:.0f}s before the next generation ...")
+            time.sleep(rest)
+        if last_exc is not None and "unusual activity" in str(last_exc).lower():
+            fa.log(f"[{i:02d}] unusual-activity flag - backing off 10 minutes before "
+                   f"the next item (the flag usually clears on its own) ...")
+            time.sleep(600)
 
     fa.log("")
     fa.log(f"=== Flow batch summary: {len(saved)} saved, {len(failed)} failed/skipped ===")

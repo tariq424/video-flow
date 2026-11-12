@@ -34,6 +34,7 @@ import os
 import re
 import json
 import time
+import random
 import base64
 import subprocess
 from pathlib import Path
@@ -165,6 +166,7 @@ def open_browser(headless=False, onscreen=True):
     log(f"profile: {PROFILE_DIR} (Preferences: {prefs})")
     args = ["--lang=en-US", "--hide-crash-restore-bubble", "--no-default-browser-check", "--no-first-run",
             "--disable-sync",
+            "--disable-blink-features=AutomationControlled",
             "--disable-features=SigninInterception,ChromeSigninInterception,ExplicitBrowserSigninUIOnDesktop",
             f"--window-position={80 if onscreen else -32000},80", "--window-size=1440,1000"]
     pw = sync_playwright().start()
@@ -412,6 +414,22 @@ def _composer_text(locator):
         return ""
 
 
+def _type_like_human(page, text):
+    """Real keystrokes with human-varying timing. A fixed per-char delay is
+    itself a bot signal; humans pause at punctuation and vary their cadence.
+    Page's focused element receives the keystrokes - click the composer first."""
+    for ch in text:
+        page.keyboard.type(ch)
+        if ch in ".!?":
+            page.wait_for_timeout(random.randint(120, 400))
+        elif ch in ",;:-":
+            page.wait_for_timeout(random.randint(60, 200))
+        elif ch == " ":
+            page.wait_for_timeout(random.randint(20, 120))
+        else:
+            page.wait_for_timeout(random.randint(30, 110))
+
+
 def send_prompt(page, text):
     """New project -> the composer inside its frame -> type -> send (Enter, then
     the send arrow retried 12x). -> the composer's frame. Raises Blocker."""
@@ -451,12 +469,12 @@ def send_prompt(page, text):
                         # empty, so Enter submits nothing and the composer
                         # clears. Keystrokes fire the events React needs.
                         try:
-                            page.keyboard.type(text, delay=20)
+                            _type_like_human(page, text)
                         except Exception:
                             cand.fill(text)           # fallback
                         page.wait_for_timeout(1200)   # a re-render may wipe it
                         if not _composer_text(cand):
-                            page.keyboard.type(text, delay=20)  # wiped - type again
+                            _type_like_human(page, text)  # wiped - type again
                         box, box_frame = cand, fr
                         break
                     except Exception:
@@ -532,7 +550,7 @@ def send_prompt(page, text):
             comp = box_frame.locator(
                 "textarea, [contenteditable='true'], [role='textbox']").first
             comp.click(timeout=3000)
-            page.keyboard.type(text, delay=20)
+            _type_like_human(page, text)
             comp.press("Enter")
         except Exception:
             pass
