@@ -110,9 +110,14 @@ def _manual_scenes(prompts, target, skip_existing=True):
         desc = fa.sanitize_prompt(desc)
         ph = _prompt_hash(desc)
         dest = Path(target) / f"scene_{i:02d}.jpg"
-        if skip_existing and dest.is_file() and (meta.get(dest.name) or {}).get("prompt_hash") == ph:
+        rec = (meta.get(dest.name) or {}) if dest.is_file() else {}
+        if skip_existing and dest.is_file() and rec.get("source") != "stock" \
+                and rec.get("prompt_hash") == ph:
             fa.log(f"[{i:02d}] SKIP - {dest.name} already exists (same prompt)")
             continue
+        if skip_existing and dest.is_file() and rec.get("source") == "stock":
+            fa.log(f"[{i:02d}] QUEUED - {dest.name} is a stock fallback image "
+                   "(low relevance) - replacing with a real Flow generation")
         out.append({"n": i, "prompt": desc, "narration": narr, "hash": ph})
     return out
 
@@ -400,15 +405,21 @@ def run_batch(prompts, target, skip_existing=False):
         dest = Path(target) / f"scene_{i:02d}.{ext}"
 
         # resume mode: keep an existing still ONLY if it was generated from
-        # the same prompt - a new script must regenerate, not reuse
+        # the same prompt - a new script must regenerate, not reuse. A still
+        # that came from the STOCK FALLBACK is never "fresh": it is a generic
+        # web image with weak relevance to its beat, so it always regenerates.
         if skip_existing and dest.is_file():
             rec = meta.get(dest.name) or {}
-            if rec.get("prompt_hash") == _prompt_hash(desc):
+            if rec.get("source") == "stock":
+                fa.log(f"[{i:02d}] REGENERATE - {dest.name} is a stock fallback "
+                       "image (low relevance) - replacing with a Flow generation")
+            elif rec.get("prompt_hash") == _prompt_hash(desc):
                 fa.log(f"[{i:02d}] SKIP - {dest.name} already exists (same prompt)")
                 saved.append(i)
                 continue
-            fa.log(f"[{i:02d}] REGENERATE - {dest.name} exists but was made "
-                   "from a different prompt")
+            else:
+                fa.log(f"[{i:02d}] REGENERATE - {dest.name} exists but was made "
+                       "from a different prompt")
 
         fa.log(f"[{i:02d}] Flow {kind} generation: {desc[:90]}{'...' if len(desc) > 90 else ''}")
 
@@ -486,10 +497,14 @@ def run_batch(prompts, target, skip_existing=False):
             except Exception as se:
                 fa.log(f"[{i:02d}] stock fallback error: {type(se).__name__}: {str(se)[:120]}")
             if stock_ok:
+                # "source": "stock" marks this still as a generic web image -
+                # resume and prepare-batch treat it as STALE so a real Flow
+                # generation always replaces it on the next run
                 meta[dest.name] = {"prompt_hash": ph,
+                                   "source": "stock",
                                    "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
                 _save_meta(target, meta)
-                fa.log(f"[{i:02d}] SAVED (stock) -> {dest}")
+                fa.log(f"[{i:02d}] SAVED (stock FALLBACK, low relevance) -> {dest}")
                 saved.append(i)
                 last_exc = None
 

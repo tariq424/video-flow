@@ -216,7 +216,8 @@ def attach_or_launch(onscreen=True):
     from playwright.sync_api import sync_playwright
     if cdp_alive():
         pw = sync_playwright().start()
-        ctx = pw.chromium.connect_over_cdp(CDP_URL)
+        ctxb = pw.chromium.connect_over_cdp(CDP_URL)
+        ctx = ctxb.contexts[0] if ctxb.contexts else ctxb.new_context()
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         page.set_default_timeout(20000)
         log(f"attached to the running manual-assist browser (CDP :{CDP_PORT})")
@@ -240,7 +241,8 @@ def attach_or_launch(onscreen=True):
     if not cdp_alive():
         raise Blocker(f"Chrome did not expose CDP on port {CDP_PORT} within 30s")
     pw = sync_playwright().start()
-    ctx = pw.chromium.connect_over_cdp(CDP_URL)
+    ctxb = pw.chromium.connect_over_cdp(CDP_URL)
+    ctx = ctxb.contexts[0] if ctxb.contexts else ctxb.new_context()
     page = ctx.pages[0] if ctx.pages else ctx.new_page()
     page.set_default_timeout(20000)
     log(f"launched the manual-assist browser on OUR profile (CDP :{CDP_PORT}) - "
