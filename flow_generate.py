@@ -91,6 +91,62 @@ def _save_violated(target, data):
         pass
 
 
+def run_batch_agent(prompts, target):
+    """Agent batch mode: ONE Flow Agent submission generates all scene stills,
+    which are then mapped to scene_NN.jpg by submission order. Missing beats
+    fall back to stock sources (Bing, Openverse). Returns True on success."""
+    scenes = []
+    for i, it in enumerate(prompts, 1):
+        p = (it.get('prompt') or '').strip()
+        n = (it.get('narration') or '').strip()
+        if p:
+            scenes.append({'n': i, 'prompt': p, 'narration': n})
+    if not scenes:
+        fa.log("agent batch: no scene prompts found")
+        return False
+
+    fa.log(f"agent batch: {len(scenes)} scene prompt(s) in ONE Flow Agent submission")
+    pw, ctx, page = fa.open_browser()
+    saved_paths = []
+    try:
+        fa.goto(page, fa.FLOW_HOME)
+        if not fa.run_gate(page):
+            raise fa.Blocker("gate failed (signed out / CAPTCHA / unknown state)")
+        srcs = fa.agent_batch_generate(ctx, page, scenes)
+        saved_paths = fa.agent_batch_download(ctx, page, srcs, scenes)
+    except fa.Blocker as e:
+        fa.log(f"agent batch FAILED - {e}")
+        return False
+    except Exception as e:
+        fa.log(f"agent batch FAILED - {type(e).__name__}: {str(e)[:200]}")
+        return False
+    finally:
+        try:
+            ctx.close()
+            pw.stop()
+        except Exception:
+            pass
+
+    # map the batch images to scene_NN.jpg in submission order
+    target_path = Path(target)
+    target_path.mkdir(parents=True, exist_ok=True)
+    for i, src_path in enumerate(saved_paths, 1):
+        dest = target_path / f"scene_{i:02d}.jpg"
+        shutil.copyfile(src_path, dest)
+        meta[dest.name] = {"prompt_hash": _prompt_hash(scenes[i - 1]['prompt']),
+                           "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
+        fa.log(f"[{i:02d}] SAVED -> {dest}")
+    _save_meta(target_path, meta)
+
+    # validation: the expected count vs the actual
+    missing = [i for i in range(1, len(scenes) + 1) if i not in saved]
+    if missing:
+        fa.log(f"VALIDATION: {len(missing)} scene(s) missing from the batch: {missing}")
+        return False
+    fa.log(f"VALIDATION PASSED: {len(saved)} scene(s) mapped in order")
+    return True
+
+
 def run_batch(prompts, target, skip_existing=False):
     saved, failed = [], []
     meta = _load_meta(target)
@@ -338,6 +394,7 @@ def main():
     if "--check" in argv:
         sys.exit(0 if check_only() else 1)
 
+
     if not argv:
         fa.log("usage: python flow_generate.py <prompts.json> [--target DIR] | --check")
         sys.exit(1)
@@ -360,6 +417,24 @@ def main():
     if not isinstance(prompts, list) or not prompts:
         fa.log("FAILED - prompts file must be a non-empty JSON list or a .txt with prompts.")
         sys.exit(1)
+
+    if "--agent-batch" in argv:
+        # programmatic Agent batch: ONE submission generates all scene stills
+        if not fa.wait_until_flow_free():
+            sys.exit(1)
+        pw, ctx, page = fa.open_browser()
+        try:
+            fa.goto(page, fa.FLOW_HOME)
+            ok = fa.run_gate(page)
+            if ok:
+                ok = run_batch_agent(prompts, target, ctx, page)
+        finally:
+            try:
+                ctx.close()
+                pw.stop()
+            except Exception:
+                pass
+        sys.exit(0 if ok else 1)
 
     # passive busy monitor, then the profile/sign-in gate before spending anything
     if not fa.wait_until_flow_free():

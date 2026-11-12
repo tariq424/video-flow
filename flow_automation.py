@@ -835,3 +835,161 @@ def generate(desc, kind, aspect="16:9"):
     finally:
         ctx.close()
         pw.stop()
+
+
+# ---------------------------------------------------------------- Agent batch
+# The user proved manually: ONE Agent request containing all scene prompts
+# (each with its narration) generates every image as its own asset. This is
+# the batch-oriented workflow - one browser session, one submission, far
+# below the per-item request volume that tripped the unusual-activity flag.
+
+AGENT_BATCH_PREAMBLE = """Generate exactly one separate image for each image description provided.
+
+Each description is followed by a NARRATION section.
+- Generate ONE image per description.
+- Treat every description as an independent scene.
+- Use narration only as context.
+- Maintain the original scene order.
+- Generate photorealistic, cinematic, 16:9 landscape images.
+- No text, captions, letters, logos, or watermarks.
+- Do not combine scenes into collages.
+- Save each image as a separate project asset.
+- Process every prompt in the batch.
+- Report which images succeeded or failed."""
+
+
+def _type_into_composer(page, locator, text):
+    """Click, then type with real keystrokes (Flow's React composer does not
+    register programmatic fill on current builds)."""
+    locator.click(timeout=5000)
+    try:
+        locator.fill("")
+    except Exception:
+        pass
+    page.keyboard.type(text, delay=12)
+
+
+def agent_batch_generate(ctx, page, scenes, poll_s=2700):
+    """ONE Agent submission with all scene prompts -> poll -> download.
+
+    scenes: [{"n": 1, "prompt": ..., "narration": ...}, ...] in scene order.
+    Returns the list of saved image paths (batch_scene_NN.jpg) in order.
+    Raises Blocker when the submission or the batch fails validation."""
+    sent_text = AGENT_BATCH_PREAMBLE + "\n\n"
+    for s in scenes:
+        sent_text += f"Scene {s['n']}: {s['prompt']}\n"
+        if s.get("narration"):
+            sent_text += f"NARRATION: {s['narration']}\n"
+        sent_text += "\n"
+
+    close_news(page)
+    newproj = _pick(page, ["button:has-text('New project')", ":text('New project')", "button:has-text('add')"])
+    try:
+        newproj.first.click(timeout=10000)
+        log("clicked New project for the batch")
+    except Exception:
+        raise Blocker("'New project' button not found/clickable")
+    # the agent greeting race: give it time to finish before typing
+    page.wait_for_timeout(15000)
+    close_news(page)
+
+    # composer: find + type (real keystrokes) + verify survival + re-type
+    inv, box, box_frame = [], None, None
+    for fr in page.frames:
+        ta = fr.locator("textarea")
+        ce = fr.locator("[contenteditable='true']")
+        tb = fr.locator("[role='textbox']")
+        n = ta.count() + ce.count() + tb.count()
+        if n:
+            inv.append(f"frame={_frame_tag(fr)}: textarea={ta.count()} "
+                       f"contenteditable={ce.count()} textbox={tb.count()}")
+        if box is None:
+            for loc in (ta, ce, tb):
+                for i in range(min(loc.count(), 5)):
+                    cand = loc.nth(i)
+                    try:
+                        cand.click(timeout=3000)
+                        cand.fill(sent_text)
+                        page.wait_for_timeout(1200)
+                        if not _composer_text(cand):
+                            cand.fill(sent_text)   # wiped once - fill again
+                        box, box_frame = cand, fr
+                        break
+                    except Exception:
+                        continue
+                if box:
+                    break
+        if box:
+            break
+    log("in-frame inventory: " + ("; ".join(inv) if inv else "no editors on any frame"))
+    if box is None:
+        shot = _screenshot(page, "flow_composer.png")
+        raise Blocker(f"in-frame composer not drivable after New project - "
+                      f"iframes: {len(page.frames)}; screenshot {shot}")
+    log(f"composer driven inside frame {_frame_tag(box_frame)}")
+
+    try:
+        box.press("Enter")
+    except Exception:
+        pass
+    page.wait_for_timeout(1500)
+
+    def left():
+        try:
+            return (box.input_value() if box.evaluate("e => 'value' in e") else box.inner_text()).strip()
+        except Exception:
+            return ""
+
+    for _try in range(12):
+        if not left():
+            break
+        if _try % 2 == 0:
+            try:
+                box.press("Enter")
+            except Exception:
+                pass
+        for sel in SEND_BUTTON_SELECTORS:
+            try:
+                b = box_frame.locator(sel).last
+                if b.is_visible(timeout=600) and b.is_enabled():
+                    b.click(timeout=4000)
+                    break
+            except Exception:
+                continue
+        page.wait_for_timeout(2500)
+    if left():
+        shot = _screenshot(page, "flow_composer.png")
+        raise Blocker(f"prompt typed but not sent (Enter + send arrow ignored 12 tries) - screenshot {shot}")
+    log("batch prompt sent (session-verified)")
+
+    # poll until the batch's images appear
+    before = set(frames_imgs(page))
+    t0 = time.time()
+    new_srcs = []
+    while time.time() - t0 < poll_s:
+        page.wait_for_timeout(10000)
+        new_srcs = [s for s in frames_imgs(page) if s not in before]
+        if len(new_srcs) >= len(scenes):
+            break
+        refusal = _session_refusal(page, sent_text)
+        if refusal:
+            raise Blocker("Flow refused the batch - session says: " + refusal)
+    if len(new_srcs) < len(scenes):
+        shot = _screenshot(page, "flow_batch_fail.png")
+        raise Blocker(f"batch incomplete: {len(new_srcs)} of {len(scenes)} images "
+                      f"within {poll_s}s - page state saved to {shot}")
+    log(f"batch complete: {len(new_srcs)} new image(s) detected")
+    return new_srcs
+
+
+def agent_batch_download(ctx, page, srcs, scenes):
+    """Download the batch's images in submission order.
+    -> the list of saved paths (OUTPUT_DIR/batch_scene_NN.jpg)."""
+    paths = []
+    for i, src in enumerate(srcs[:len(scenes)], 1):
+        data = _download(src, ctx, page, "image")
+        if not data:
+            raise Blocker(f"batch image {i} download failed ({src[:80]})")
+        paths.append(_save(data, f"batch_scene_{i:02d}.jpg"))
+        log(f"batch image {i} downloaded ({len(data) // 1024} KB)")
+    return paths
