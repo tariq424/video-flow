@@ -215,31 +215,47 @@ def open_project_session(target):
     return True
 
 
-def import_batch(prompts, target):
-    """Manual-assist step 3: diff the Flow window's images against the import
-    baseline, download the new ones in DOM (chronological) order and map them
-    to the prepared scene numbers. On a count mismatch nothing is mapped
-    (order would be guesswork) - the user generates the rest and re-imports."""
+def import_batch(prompts, target, project_url=None):
+    """Manual-assist step 3: read the generated images from a Flow project and
+    map them to scene_NN.jpg in DOM (chronological) order.
+
+    project_url: the URL the user pasted into (any window, same account) -
+    overrides the recorded baseline URL. When the URL does not match the
+    baseline (or no baseline exists), ALL images visible in the project are
+    the candidate set - designed for a BRAND-NEW project where every image
+    belongs to the paste. On a count mismatch nothing is mapped (order would
+    be guesswork) - the user generates the rest and re-imports."""
     base_path = Path(target) / "import_baseline.json"
-    if not base_path.is_file():
-        fa.log("no import_baseline.json - run --prepare-batch and --open-project first")
+    base = json.loads(base_path.read_text(encoding="utf-8")) if base_path.is_file() else {}
+    todo_path = Path(target) / "scenes_todo.json"
+    if todo_path.is_file():
+        todo = json.loads(todo_path.read_text(encoding="utf-8"))
+    else:
+        # no prepare step ran - build the todo from the script itself
+        todo = [{"n": i, "hash": _prompt_hash(fa.sanitize_prompt(str(it.get("prompt", "")).strip()))}
+                for i, it in enumerate(prompts, 1)]
+    if not todo:
+        fa.log("no scenes to import - prepare the batch first")
         return False
-    base = json.loads(base_path.read_text(encoding="utf-8"))
-    todo = base.get("todo") or []
+    url = project_url or base.get("url") or fa.PROJECT_URL or fa.FLOW_HOME
     if not fa.cdp_alive():
-        fa.log("the manual-assist browser is closed - run --open-project again, "
-               "paste the batch, and import before closing it")
-        return False
+        fa.log("no manual-assist browser running - launching one (same profile, "
+               "so the same account sees the project) ...")
     pw, ctx, page = fa.attach_or_launch()
     try:
-        url = base.get("url") or (fa.PROJECT_URL or fa.FLOW_HOME)
         fa.goto(page, url)
         if not fa.run_gate(page):
             fa.log("sign-in not confirmed - complete it inside the window and re-run import")
             return False
-        before = set(base.get("srcs") or [])
-        new_srcs = [s for s in fa.frames_imgs(page) if s not in before]
-        fa.log(f"import: {len(new_srcs)} new image(s) found "
+        same_base = base.get("url") == url and base.get("srcs")
+        before = set(base.get("srcs") or []) if same_base else set()
+        if same_base:
+            new_srcs = [s for s in fa.frames_imgs(page) if s not in before]
+        else:
+            new_srcs = list(fa.frames_imgs(page))
+            fa.log("no matching baseline for this URL - treating ALL images in "
+                   "the project as the batch (use a brand-new project!)")
+        fa.log(f"import: {len(new_srcs)} image(s) found "
                f"({len(todo)} expected)")
         if len(new_srcs) < len(todo):
             fa.log(f"IMPORT INCOMPLETE: {len(todo) - len(new_srcs)} scene image(s) "
@@ -247,8 +263,9 @@ def import_batch(prompts, target):
                    f"ones) and click 'Import Flow stills' again. Nothing was mapped.")
             return False
         if len(new_srcs) > len(todo):
-            fa.log("more new images than expected - mapping the FIRST "
-                   f"{len(todo)} in order (extra images stay in Flow)")
+            fa.log("more images than expected - mapping the FIRST "
+                   f"{len(todo)} in DOM order (chronological = scene order; "
+                   "extra images stay in Flow)")
             new_srcs = new_srcs[:len(todo)]
 
         target_path = Path(target)
@@ -630,12 +647,18 @@ def main():
     # ---- manual-assist workflow (paste-proof against Google's automation
     # guard): the factory prepares the batch, the human pastes and sends it in
     # the REAL browser window, the factory imports the finished stills.
+    project_url = None
+    if "--project-url" in argv:
+        k = argv.index("--project-url")
+        if k + 1 < len(argv):
+            project_url = argv[k + 1].strip()
+            argv = argv[:k] + argv[k + 2:]
     if "--prepare-batch" in argv:
         sys.exit(0 if prepare_batch(prompts, target) else 1)
     if "--open-project" in argv:
         sys.exit(0 if open_project_session(target) else 1)
     if "--import-batch" in argv:
-        sys.exit(0 if import_batch(prompts, target) else 1)
+        sys.exit(0 if import_batch(prompts, target, project_url=project_url) else 1)
 
     if "--agent-batch" in argv:
         # programmatic Agent batch: ONE submission generates all scene stills
