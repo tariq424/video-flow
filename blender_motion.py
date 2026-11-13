@@ -34,7 +34,14 @@ BLENDER_CANDIDATES = [
 ]
 
 # motion variants inside Blender (perspective camera on a textured plane)
-MOTIONS_B = ["push-in", "pan-right", "pull-out", "parallax-l", "pan-left", "parallax-r"]
+MOTIONS_B = ["push-in", "pan-right", "pull-out", "parallax-l", "tilt-down",
+             "pan-left", "parallax-r", "tilt-up", "crane-up", "diag-drift",
+             "slow-roll"]
+
+# stills from Flow are 1632x912 - below 1080p. Camera moves MAGNIFY them at
+# the tight end (softness). Upscale to 2880 wide (lanczos + light sharpen)
+# so the camera only ever minifies: max on-screen magnification ~= 1.02x.
+UPSCALE_WIDTH = 2880
 
 BPY_TEMPLATE = r'''
 import bpy, json, sys, os, math
@@ -48,7 +55,7 @@ scene.render.resolution_x = cfg["width"]
 scene.render.resolution_y = cfg["height"]
 scene.render.fps = int(cfg["fps"])
 scene.render.image_settings.file_format = "JPEG"
-scene.render.image_settings.quality = 92
+scene.render.image_settings.quality = 96
 scene.render.use_file_extension = True
 
 # workbench TEXTURE shading: the still shown unlit, exactly as generated
@@ -102,6 +109,7 @@ for k, sc in enumerate(cfg["scenes"], 1):
     z_near = dist(pw, 0.66)  # tightest: ~66% of the image in frame
     z_mid = dist(pw, 0.76)
     travel = (pw - pw * 0.76) * 0.8   # 80% of the safe pan range
+    vtravel = travel * cfg["height"] / cfg["width"]   # same amount, screen-vertical
     cam.location = (0.0, 0.0, z_far)
     cam.rotation_euler = (0.0, 0.0, 0.0)
     f_end_rot = None
@@ -123,6 +131,27 @@ for k, sc in enumerate(cfg["scenes"], 1):
         f_end_loc = (travel * 0.35, 0.0, dist(pw, 0.70))
         cam.rotation_euler = (0.0, 0.0, _m.radians(2.5))
         f_end_rot = (0.0, 0.0, _m.radians(-2.5))
+    elif m == "tilt-down":
+        # camera pitches down->level-ish: view angle change on a flat photo
+        cam.location = (0.0, 0.9 * travel, dist(pw, 0.88))
+        f_end_loc = (0.0, -0.2 * travel, dist(pw, 0.72))
+        cam.rotation_euler = (_m.radians(7.0), 0.0, 0.0)
+        f_end_rot = (_m.radians(-2.0), 0.0, 0.0)
+    elif m == "tilt-up":
+        cam.location = (0.0, -0.9 * travel, dist(pw, 0.88))
+        f_end_loc = (0.0, 0.2 * travel, dist(pw, 0.72))
+        cam.rotation_euler = (_m.radians(-7.0), 0.0, 0.0)
+        f_end_rot = (_m.radians(2.0), 0.0, 0.0)
+    elif m == "crane-up":
+        cam.location = (0.0, -vtravel, z_mid); f_end_loc = (0.0, vtravel, z_mid)
+    elif m == "diag-drift":
+        cam.location = (-travel * 0.7, -vtravel * 0.5, dist(pw, 0.90))
+        f_end_loc = (travel * 0.7, vtravel * 0.5, dist(pw, 0.70))
+    elif m == "slow-roll":
+        cam.location = (0.0, 0.0, dist(pw, 0.82))
+        f_end_loc = (0.0, 0.0, dist(pw, 0.70))
+        cam.rotation_euler = (0.0, 0.0, _m.radians(-1.3))
+        f_end_rot = (0.0, 0.0, _m.radians(1.3))
     else:
         cam.location = (0.0, 0.0, z_far); f_end_loc = (0.0, 0.0, z_near)
 
@@ -179,7 +208,28 @@ def render_blender_storyboard(scenes, timeline_out, width=1920, height=1080, fps
         motion = s.get("motion") if s.get("motion") in MOTIONS_B \
             else MOTIONS_B[(i - 1) % len(MOTIONS_B)]
         cfg_scenes.append({"image": os.path.abspath(s["image"]), "frames": frames,
-                           "motion": motion})
+                           "motion": motion, "n": i})
+
+    # pre-upscale every still (lanczos + light sharpen) so the camera only
+    # ever minifies - the #1 defense against soft output
+    upscaled = 0
+    for sc in cfg_scenes:
+        up = os.path.join(out_dir, f"up_{sc['n']:02d}.jpg")
+        if not os.path.isfile(up):
+            r = subprocess.run(
+                ["ffmpeg", "-y", "-loglevel", "error", "-i", sc["image"],
+                 "-vf", f"scale={UPSCALE_WIDTH}:-2:flags=lanczos,"
+                        f"unsharp=5:5:0.4:3:3:0.0",
+                 "-q:v", "2", up],
+                capture_output=True, text=True)
+            if r.returncode != 0 or not os.path.isfile(up):
+                print(f"blender: upscale failed for scene {sc['n']} "
+                      f"({r.stderr[:120]}) - using the original still")
+                continue
+            upscaled += 1
+        sc["image"] = up
+    print(f"blender: {upscaled}/{len(cfg_scenes)} still(s) upscaled to "
+          f"{UPSCALE_WIDTH}px (sharpened)")
 
     cfg_path = os.path.join(out_dir, "blender_cfg.json")
     with open(cfg_path, "w", encoding="utf-8") as f:
@@ -224,7 +274,7 @@ def render_blender_storyboard(scenes, timeline_out, width=1920, height=1080, fps
         r = subprocess.run(["ffmpeg", "-y", "-loglevel", "error",
                             "-framerate", str(fps),
                             "-i", os.path.join(frames_dir, "frame_%04d.jpg"),
-                            "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+                            "-c:v", "libx264", "-preset", "slow", "-crf", "17",
                             "-pix_fmt", "yuv420p", part],
                            capture_output=True, text=True)
         if r.returncode != 0 or not os.path.isfile(part):
