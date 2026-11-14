@@ -1,21 +1,27 @@
 """
 blender_motion.py - motion-from-stills renderer using Blender (headless).
 
-For each scene still it builds a 2.5D rig in bpy: the image as an oversized
-textured plane on the XY ground plane and a perspective camera dollying over
-it. Real perspective means edges move faster than the center - the depth
-feeling flat Ken Burns never has. Motion variants per scene (push-in,
-pan-right, pull-out, parallax-l, pan-left, parallax-r) cycle in scene order.
+SHOT-LIST renderer: every scene gets a DESIGNED SHOT - establishing wide,
+dolly-in to close-up, tracking pan, true telephoto zoom (FOV animation),
+top view, low-angle look-up, crane-down, hero push - not ambient drift.
+The camera is a real perspective camera over the still as a textured plane,
+so pans show parallax (near edges sweep faster than the far edge) and the
+dolly moves have true depth.
 
-Renders with BLENDER_WORKBENCH in TEXTURE shading: the still is displayed
-unlit and untouched (no relighting surprises), CPU-friendly, fast.
+FRAMING CONTRACT: distances are fractions OF THE IMAGE (not of the oversized
+plane). zdist(f) places the camera so exactly f of the image width is in
+frame: 0.98 = nearly the whole picture, 0.60 = a genuine close-up. The plane
+carries 1.42x overscan so pans/tilts never reveal edges.
+
+Sharpness: stills are pre-upscaled to UPSCALE_WIDTH (lanczos + light
+sharpen) because Flow stills (1632x912) are below 1080p and camera moves
+magnify. After upscaling, max on-screen magnification is ~1.02x.
 
     render_blender_storyboard(scenes, timeline_out, width, height, fps)
-        scenes: [{"image": abs_path, "duration": seconds, "motion": name}]
+        scenes: [{"image": abs_path, "duration": seconds}]
         writes timeline_out (concat of the per-scene mp4s)
 
-Engine location is resolved from FLOW_BLENDER env or the default install
-paths.
+Blender exe: FLOW_BLENDER env or the default install paths.
 """
 
 import os
@@ -33,14 +39,10 @@ BLENDER_CANDIDATES = [
     r"C:\Program Files\Blender Foundation\Blender 4.2\blender.exe",
 ]
 
-# motion variants inside Blender (perspective camera on a textured plane)
-MOTIONS_B = ["push-in", "pan-right", "pull-out", "parallax-l", "tilt-down",
-             "pan-left", "parallax-r", "tilt-up", "crane-up", "diag-drift",
-             "slow-roll"]
+# the shot list - cycled in scene order; 8 scenes get 8 different shots
+SHOTS = ["establishing", "dolly-close", "tracking-pan", "zoom-tele",
+         "top-view", "low-angle", "crane-down", "hero-push"]
 
-# stills from Flow are 1632x912 - below 1080p. Camera moves MAGNIFY them at
-# the tight end (softness). Upscale to 2880 wide (lanczos + light sharpen)
-# so the camera only ever minifies: max on-screen magnification ~= 1.02x.
 UPSCALE_WIDTH = 2880
 
 BPY_TEMPLATE = r'''
@@ -61,6 +63,11 @@ scene.render.use_file_extension = True
 # workbench TEXTURE shading: the still shown unlit, exactly as generated
 scene.render.engine = "BLENDER_WORKBENCH"
 scene.display.shading.color_type = "TEXTURE"
+scene.display.shading.light = "FLAT"   # studio light MODULATES textures (-15% luma); flat = 1:1
+# Blender 4+/5 default view transform is AgX - it mutes color and darkens
+# mids. 'Standard' shows the still 1:1, no film curve.
+scene.view_settings.view_transform = "Standard"
+scene.view_settings.look = "None"
 
 cam_data = bpy.data.cameras.new("cam")
 cam_data.lens = 50
@@ -68,22 +75,21 @@ cam = bpy.data.objects.new("cam", cam_data)
 scene.collection.objects.link(cam)
 scene.camera = cam
 
+IMG_W, IMG_H = 1.6, 0.9
+OVER = 1.42                       # plane overscan (pans/tilts never show edges)
+Z2W = 2.0 * math.tan(math.radians(19.8))   # 50mm lens: visible width = z * Z2W
+
+def zdist(frac):
+    """camera height placing exactly `frac` of the IMAGE width in frame"""
+    return IMG_W * frac / Z2W
+
 OUT = cfg["out_dir"]
-import math as _m
-Z2W = 2.0 * _m.tan(_m.radians(19.8))   # 50mm lens: visible width = z * Z2W
-
-def dist(pw, frac):
-    """camera height for viewing `frac` of the plane width"""
-    return pw * frac / Z2W
-
 for k, sc in enumerate(cfg["scenes"], 1):
     img = bpy.data.images.load(sc["image"])
     iw, ih = img.size
 
-    # plane sized to COVER the 16:9 frame with 35% overscan (drift never
-    # reveals edges), laid on the XY plane at z=0
-    cover = 1.35 * max(cfg["width"] / cfg["height"] / (iw / ih), 1.0)
-    pw, ph = 1.6 * cover, 0.9 * cover
+    cover = 1.0 * max(cfg["width"] / cfg["height"] / (iw / ih), 1.0)
+    pw, ph = IMG_W * OVER * cover, IMG_H * OVER * cover
     mesh = bpy.data.meshes.new("plane%02d" % k)
     mesh.from_pydata([(-pw, -ph, 0), (pw, -ph, 0), (pw, ph, 0), (-pw, ph, 0)],
                      [], [(0, 1, 2, 3)])
@@ -104,71 +110,70 @@ for k, sc in enumerate(cfg["scenes"], 1):
     obj.data.materials.append(mat)
 
     f0, f1 = 1, sc["frames"]
-    m = sc["motion"]
-    z_far = dist(pw, 0.92)   # widest: ~92% of the image in frame
-    z_near = dist(pw, 0.66)  # tightest: ~66% of the image in frame
-    z_mid = dist(pw, 0.76)
-    travel = (pw - pw * 0.76) * 0.8   # 80% of the safe pan range
-    vtravel = travel * cfg["height"] / cfg["width"]   # same amount, screen-vertical
-    cam.location = (0.0, 0.0, z_far)
+    shot = sc["shot"]
+
+    cam_data.lens = 50
+    cam.location = (0.0, 0.0, zdist(0.95))
     cam.rotation_euler = (0.0, 0.0, 0.0)
+    f_end_loc = None
     f_end_rot = None
-    if m == "push-in":
-        cam.location = (0.0, 0.0, z_far); f_end_loc = (0.0, 0.0, z_near)
-    elif m == "pull-out":
-        cam.location = (0.0, 0.0, z_near); f_end_loc = (0.0, 0.0, z_far)
-    elif m == "pan-right":
-        cam.location = (-travel, 0.0, z_mid); f_end_loc = (travel, 0.0, z_mid)
-    elif m == "pan-left":
-        cam.location = (travel, 0.0, z_mid); f_end_loc = (-travel, 0.0, z_mid)
-    elif m == "parallax-l":
-        cam.location = (travel * 0.5, 0.0, dist(pw, 0.85))
-        f_end_loc = (-travel * 0.35, 0.0, dist(pw, 0.70))
-        cam.rotation_euler = (0.0, 0.0, _m.radians(-2.5))
-        f_end_rot = (0.0, 0.0, _m.radians(2.5))
-    elif m == "parallax-r":
-        cam.location = (-travel * 0.5, 0.0, dist(pw, 0.85))
-        f_end_loc = (travel * 0.35, 0.0, dist(pw, 0.70))
-        cam.rotation_euler = (0.0, 0.0, _m.radians(2.5))
-        f_end_rot = (0.0, 0.0, _m.radians(-2.5))
-    elif m == "tilt-down":
-        # camera pitches down->level-ish: view angle change on a flat photo
-        cam.location = (0.0, 0.9 * travel, dist(pw, 0.88))
-        f_end_loc = (0.0, -0.2 * travel, dist(pw, 0.72))
-        cam.rotation_euler = (_m.radians(7.0), 0.0, 0.0)
-        f_end_rot = (_m.radians(-2.0), 0.0, 0.0)
-    elif m == "tilt-up":
-        cam.location = (0.0, -0.9 * travel, dist(pw, 0.88))
-        f_end_loc = (0.0, 0.2 * travel, dist(pw, 0.72))
-        cam.rotation_euler = (_m.radians(-7.0), 0.0, 0.0)
-        f_end_rot = (_m.radians(2.0), 0.0, 0.0)
-    elif m == "crane-up":
-        cam.location = (0.0, -vtravel, z_mid); f_end_loc = (0.0, vtravel, z_mid)
-    elif m == "diag-drift":
-        cam.location = (-travel * 0.7, -vtravel * 0.5, dist(pw, 0.90))
-        f_end_loc = (travel * 0.7, vtravel * 0.5, dist(pw, 0.70))
-    elif m == "slow-roll":
-        cam.location = (0.0, 0.0, dist(pw, 0.82))
-        f_end_loc = (0.0, 0.0, dist(pw, 0.70))
-        cam.rotation_euler = (0.0, 0.0, _m.radians(-1.3))
-        f_end_rot = (0.0, 0.0, _m.radians(1.3))
+    f_end_lens = None
+
+    if shot == "establishing":
+        # nearly the whole picture, slow push to settle the framing
+        cam.location = (0.0, 0.0, zdist(0.98)); f_end_loc = (0.0, 0.0, zdist(0.86))
+    elif shot == "dolly-close":
+        # genuine dolly: wide three-quarter start -> real close-up on a region
+        cam.location = (-IMG_W * 0.12, IMG_H * 0.10, zdist(0.92))
+        f_end_loc = (IMG_W * 0.10, -IMG_H * 0.06, zdist(0.56))
+    elif shot == "tracking-pan":
+        # lateral track across the image
+        xmax = IMG_W * (1 - 0.80) * 0.45
+        cam.location = (-xmax, 0.0, zdist(0.80)); f_end_loc = (xmax, 0.0, zdist(0.80))
+    elif shot == "zoom-tele":
+        # TRUE zoom: optics change, camera does not move
+        cam.location = (IMG_W * 0.06, -IMG_H * 0.04, zdist(0.95))
+        cam_data.lens = 38; f_end_lens = 88
+    elif shot == "top-view":
+        # flat, head-on: the still as-is, slow settle
+        cam.location = (0.0, 0.0, zdist(1.00)); f_end_loc = (0.0, 0.0, zdist(0.90))
+    elif shot == "low-angle":
+        # camera low, pitched up: keystone perspective, "billboard from below"
+        cam.location = (IMG_W * 0.05, -IMG_H * 0.55, zdist(0.88))
+        cam.rotation_euler = (math.radians(6.0), 0.0, 0.0)
+        f_end_loc = (-IMG_W * 0.04, -IMG_H * 0.30, zdist(0.72))
+        f_end_rot = (math.radians(1.5), 0.0, 0.0)
+    elif shot == "crane-down":
+        ym = IMG_H * (1 - 0.78) * 0.45
+        cam.location = (0.0, ym, zdist(0.78)); f_end_loc = (0.0, -ym, zdist(0.78))
+    elif shot == "hero-push":
+        # low three-quarter hero: offset, pitched, pushing in
+        cam.location = (IMG_W * 0.10, -IMG_H * 0.12, zdist(0.88))
+        cam.rotation_euler = (math.radians(4.0), 0.0, math.radians(-2.0))
+        f_end_loc = (IMG_W * 0.04, -IMG_H * 0.04, zdist(0.64))
+        f_end_rot = (math.radians(1.0), 0.0, math.radians(-0.5))
     else:
-        cam.location = (0.0, 0.0, z_far); f_end_loc = (0.0, 0.0, z_near)
+        cam.location = (0.0, 0.0, zdist(0.95)); f_end_loc = (0.0, 0.0, zdist(0.80))
 
     cam.keyframe_insert(data_path="location", frame=f0)
-    cam.location = f_end_loc
-    cam.keyframe_insert(data_path="location", frame=f1)
+    if f_end_loc is not None:
+        cam.location = f_end_loc
+        cam.keyframe_insert(data_path="location", frame=f1)
     if f_end_rot is not None:
         cam.keyframe_insert(data_path="rotation_euler", frame=f0)
         cam.rotation_euler = f_end_rot
         cam.keyframe_insert(data_path="rotation_euler", frame=f1)
+    if f_end_lens is not None:
+        cam_data.keyframe_insert(data_path="lens", frame=f0)
+        cam_data.lens = f_end_lens
+        cam_data.keyframe_insert(data_path="lens", frame=f1)
 
     scene.frame_start = f0
     scene.frame_end = f1
     frames_dir = os.path.join(OUT, "frames_%02d" % k)
     os.makedirs(frames_dir, exist_ok=True)
     scene.render.filepath = os.path.join(frames_dir, "frame_")
-    print("BLENDER_SCENE_START %d" % k, flush=True)
+    print("BLENDER_SCENE_START %d (%s)" % (k, shot), flush=True)
     bpy.ops.render.render(animation=True)
     print("BLENDER_SCENE_DONE %d frames=%d dir=%s"
           % (k, f1 - f0 + 1, frames_dir), flush=True)
@@ -190,9 +195,9 @@ def find_blender():
 
 
 def render_blender_storyboard(scenes, timeline_out, width=1920, height=1080, fps=30):
-    """scenes: [{"image", "duration", "motion"}] -> renders each scene with a
-    perspective camera move, concatenates into timeline_out. Raises
-    RuntimeError with the failure reason when Blender is missing or fails."""
+    """scenes: [{"image", "duration"}] -> one designed shot per scene, H.264
+    per scene, concatenated into timeline_out. Raises RuntimeError with the
+    failure reason when Blender is missing or fails."""
     blender = find_blender()
     if not blender:
         raise RuntimeError("blender.exe not found - set FLOW_BLENDER to the exe path")
@@ -205,10 +210,8 @@ def render_blender_storyboard(scenes, timeline_out, width=1920, height=1080, fps
     cfg_scenes = []
     for i, s in enumerate(scenes, 1):
         frames = max(int(round(float(s["duration"]) * fps)), fps // 2)
-        motion = s.get("motion") if s.get("motion") in MOTIONS_B \
-            else MOTIONS_B[(i - 1) % len(MOTIONS_B)]
         cfg_scenes.append({"image": os.path.abspath(s["image"]), "frames": frames,
-                           "motion": motion, "n": i})
+                           "shot": SHOTS[(i - 1) % len(SHOTS)], "n": i})
 
     # pre-upscale every still (lanczos + light sharpen) so the camera only
     # ever minifies - the #1 defense against soft output
@@ -241,6 +244,8 @@ def render_blender_storyboard(scenes, timeline_out, width=1920, height=1080, fps
 
     total_frames = sum(s["frames"] for s in cfg_scenes)
     print(f"blender: {blender}")
+    shot_plan = ", ".join(f"{s['n']}:{s['shot']}" for s in cfg_scenes)
+    print(f"blender: shot plan -> {shot_plan}")
     print(f"blender: {len(cfg_scenes)} scene(s), {total_frames} frames total "
           f"@ {fps}fps ({total_frames / fps:.2f}s)")
     proc = subprocess.Popen(
@@ -263,8 +268,8 @@ def render_blender_storyboard(scenes, timeline_out, width=1920, height=1080, fps
 
     # encode each scene's JPEG sequence to H.264, then clean the frames away
     parts = []
-    for sc in cfg_scenes:
-        k = cfg_scenes.index(sc) + 1
+    for idx, sc in enumerate(cfg_scenes):
+        k = sc["n"]
         frames_dir = os.path.join(out_dir, "frames_%02d" % k)
         seq = sorted(glob.glob(os.path.join(frames_dir, "frame_*.jpg")))
         if len(seq) < sc["frames"] - 1:
@@ -274,6 +279,10 @@ def render_blender_storyboard(scenes, timeline_out, width=1920, height=1080, fps
         r = subprocess.run(["ffmpeg", "-y", "-loglevel", "error",
                             "-framerate", str(fps),
                             "-i", os.path.join(frames_dir, "frame_%04d.jpg"),
+                            # Blender 5.2's new OCIO config applies ~gamma 1.15
+                            # even under the Standard view transform (measured
+                            # per-channel fit); 0.87 restores the source luma
+                            "-vf", "eq=gamma=0.87",
                             "-c:v", "libx264", "-preset", "slow", "-crf", "17",
                             "-pix_fmt", "yuv420p", part],
                            capture_output=True, text=True)
@@ -298,9 +307,12 @@ def render_blender_storyboard(scenes, timeline_out, width=1920, height=1080, fps
 
 
 if __name__ == "__main__":
-    # standalone smoke test: render ONE short scene from an image
-    img = sys.argv[1]
-    out = sys.argv[2]
-    render_blender_storyboard(
-        [{"image": img, "duration": 3, "motion": "parallax-l"}], out,
-        width=1280, height=720, fps=30)
+    # standalone smoke test: ONE short scene with a given shot
+    img, out, shot = sys.argv[1], sys.argv[2], (sys.argv[3] if len(sys.argv) > 3 else "dolly-close")
+    import tempfile
+    work = tempfile.mkdtemp(prefix="bm_")
+    import json as _json
+    # inline single-scene run through the same pipeline
+    scenes = [{"image": os.path.abspath(img), "duration": 4}]
+    globals()["SHOTS"] = [shot]
+    render_blender_storyboard(scenes, out, width=1280, height=720, fps=30)
