@@ -51,6 +51,49 @@ Prompts `.txt` format: one scene per paragraph; a trailing `NARRATION: <text>`
 per paragraph is narration, not prompt. `--skip-existing` keeps existing
 `scene_NN.jpg` files (resume).
 
+## 3D orbit setup ([3D_ORBIT] scenes)
+
+A scene tagged `[3D_ORBIT]` goes still → background cutout → Hunyuan3D mesh
+(shape only) → Blender orbit over the blurred still. Any failure falls back
+to the 2.5D shot list. ~3–5 min per scene on the RTX 5060 Ti (12 GB VRAM
+headroom needed: ~5 GB model + Blender).
+
+| Piece | Where |
+|---|---|
+| `hunyuan3d_client.py` | picks the backend; local is the default when `Hunyuan3D-2/` exists |
+| `_hy3dgen_run.py` | runs inside `.venv3d`: rembg cutout + `Hunyuan3D-2mv` shape pipeline |
+| `blender_3d.py` | EEVEE orbit (pearl/clay material, eased turn) + ffmpeg composite |
+| `Hunyuan3D-2/` | clone of github.com/Tencent-Hunyuan/Hunyuan3D-2 at `f8db630` (gitignored) |
+| `.venv3d/` | Python 3.12 venv, exact versions in `requirements-3d.txt` (gitignored) |
+| weights | HF cache `tencent/Hunyuan3D-2mv`, subfolder `hunyuan3d-dit-v2-mv` (9 GB) |
+
+Rebuild from scratch:
+
+```
+git clone https://github.com/Tencent-Hunyuan/Hunyuan3D-2 && git -C Hunyuan3D-2 checkout f8db630
+py -3.12 -m venv .venv3d
+.venv3d\Scripts\python -m pip install -r requirements-3d.txt --extra-index-url https://download.pytorch.org/whl/cu128
+```
+
+The `-mv` weights are loaded with `Hunyuan3DDiTFlowMatchingPipeline` and a
+single `{"front": image}` view. The texture stage is not used (it needs
+custom CUDA extensions that don't build here); the mesh gets a material.
+
+| Var | Default | Meaning |
+|---|---|---|
+| `FLOW_HUNYUAN_HOME` | `./Hunyuan3D-2` | Hunyuan checkout |
+| `FLOW_HUNYUAN_PYTHON` | `./.venv3d/Scripts/python.exe` | its interpreter |
+| `FLOW_HUNYUAN_URL` | — | hosted endpoint instead of local |
+| `FLOW_3D_TIMEOUT` | `1200` | seconds before falling back to 2.5D |
+| `FLOW_3D_MATERIAL` | `pearl` | `pearl` or `clay` |
+| `FLOW_3D_ORBIT_DPS` | `10` | orbit speed, degrees/second (max 360 total) |
+| `FLOW_3D_BG_BLUR` | `18` | background blur sigma |
+| `FLOW_3D_STEPS` / `FLOW_3D_OCTREE` | `30` / `256` | mesh quality vs time |
+
+Works best when the still shows **one clear object** (a tower, a statue, a
+vehicle) — the cutout keeps the main subject, and busy effects (sparks,
+debris) become noisy geometry.
+
 ## Profile sign-in
 
 If the gate reports *signed out*:

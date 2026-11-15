@@ -27,9 +27,9 @@ import subprocess
 def describe_backend():
     """Human-readable backend status for the build log."""
     api = os.environ.get("FLOW_HUNYUAN_URL", "").strip()
-    home = os.environ.get("FLOW_HUNYUAN_HOME", "").strip()
+    home = _home()
     forced = os.environ.get("FLOW_3D_BACKEND", "").strip().lower()
-    parts = [f"api={'set' if api else 'unset'} ({api or '-'})",
+    parts =[f"api={'set' if api else 'unset'} ({api or '-'})",
              f"local={'set' if home else 'unset'} ({home or '-'})"]
     if home and os.path.isdir(home):
         parts.append("local-dir=exists")
@@ -39,9 +39,22 @@ def describe_backend():
     return "; ".join(parts)
 
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+# the local install made for this project: repo clone + its own venv
+DEFAULT_HOME = os.path.join(HERE, "Hunyuan3D-2")
+DEFAULT_PYTHON = os.path.join(HERE, ".venv3d", "Scripts", "python.exe")
+
+
+def _home():
+    home = os.environ.get("FLOW_HUNYUAN_HOME", "").strip()
+    if not home and os.path.isdir(DEFAULT_HOME):
+        home = DEFAULT_HOME
+    return home
+
+
 def _pick_backend():
     api = os.environ.get("FLOW_HUNYUAN_URL", "").strip()
-    home = os.environ.get("FLOW_HUNYUAN_HOME", "").strip()
+    home = _home()
     forced = os.environ.get("FLOW_3D_BACKEND", "").strip().lower()
     if forced == "api" and api:
         return "api", api
@@ -103,7 +116,9 @@ def _via_api(image_path, out_glb, url, timeout_s):
 def _via_local(image_path, out_glb, home, timeout_s):
     """Run hy3dgen inside the Hunyuan3D-2 checkout's python."""
     py = None
-    for cand in (os.path.join(home, ".venv", "Scripts", "python.exe"),
+    for cand in (os.environ.get("FLOW_HUNYUAN_PYTHON", "").strip(),
+                 DEFAULT_PYTHON,
+                 os.path.join(home, ".venv", "Scripts", "python.exe"),
                  os.path.join(home, "venv", "Scripts", "python.exe"),
                  os.path.join(home, "env", "Scripts", "python.exe")):
         if os.path.isfile(cand):
