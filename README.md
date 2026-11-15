@@ -1,35 +1,38 @@
-# video-flow — standalone Google Flow automation + TTS + storyboard renderer
+# video-flow — script parser, Flow batch/import, TTS and motion renderers
 
 No imports from any other project. Consumed by the NAZA Video Builder GUI
-(`F:\videos\google-flow-videos\app.py`) via subprocess, and usable standalone.
+(`F:\videos\google-flow-videos\app.py`) via subprocess and import, and usable
+standalone. The workflow and script format are documented in
+`F:\videos\google-flow-videos\Video_Factory_Spec.md`.
+
+**Flow generation is manual.** The GUI prepares one batch text; the user
+pastes it into Google Flow; this project then imports the results. Scripting
+Flow's composer gets the session flagged by Google ("unusual activity") —
+the automated runners below stop on that flag and are not the recommended path.
 
 ## Components
 
 | File | Role |
 |---|---|
-| `flow_automation.py` | Playwright driver for flow.google.com: persistent Chrome profile (`channel="chrome"`, `headless=False`), sign-in gate, CAPTCHA wait (10 min, solved by hand), popup/"what's new" closing, in-frame composer send (Enter + 12-try send-arrow), cost-card regex `costing\s+(\d+)\s+credits?`, header-validated downloads (`ftyp` MP4/WebM, JPEG/PNG), plain-Approve (never "Always approve") / stills-only-at-0-credits policy, passive busy monitor |
-| `flow_generate.py` | CLI batch runner: `<prompts.json|.txt> [--target DIR] [--skip-existing]` or `--check` (sign-in gate only). `.txt` = plain paragraphs → image-only items; `NARRATION:` lines are stripped from prompts and carried separately |
-| `tts.py` | Edge-TTS narration (`en-US-ChristopherNeural`, `FLOW_TTS_VOICE` overrides), one retry on transient failures |
-| `render_storyboard.py` | Remotion storyboard renderer (Ken Burns + two-layer parallax + crossfades). Long-render flush errors are recovered: a complete output after a non-zero exit is validated (header + size/duration) and accepted; browser-start flakes retry (3 attempts) |
-| `remotion/` | The Remotion project (`src/Storyboard.jsx` = the motion engine; `npm install` done) |
+| `flow_generate.py` | Script parser (`parse_prompts_text`: scenes, `NARRATION:`, tags `[STILL]`/`[BLENDER]`/`[VIDEO]`/`[3D_ORBIT]`, pasted-back batch text converted back), `scene_plan` (the one scene list: number, prompt as written, hash, narration, mode, asset file), batch text (`--prepare-batch`), import (`--import-batch` from a project URL or `--from-folder`), `tts_lines` (one TTS line per scene). Also the older automated runners (`run_batch`, `--agent-batch`). |
+| `flow_automation.py` | Playwright/Chrome helpers for flow.google.com: persistent profile, sign-in gate, media discovery (`frames_imgs`, `frames_videos`), validated downloads (JPEG/PNG, `ftyp` MP4/WebM). Session checks: Google's automation flag raises `AutomationFlagged` (stop, record nothing); real content refusals are reported separately. |
+| `tts.py` | Edge-TTS (`en-US-ChristopherNeural`, `FLOW_TTS_VOICE` overrides). One line per scene, each voiced and measured separately (`[SILENCE]` = pause), joined into one mp3; per-scene lengths saved as `segments` in `<out>.meta.json`. |
+| `blender_motion.py` | Headless Blender renderer. Per scene by mode: 2.5D shot list over the still (plane = the image, every keyframe clamped so no edge shows; ≤14 s sub-shots with hard cuts), `[VIDEO]` clip splice (trim / hold ≤2 s / continue with shots over the last frame; audio dropped), `[3D_ORBIT]` via `blender_3d.py` with fallback to 2.5D. Logs each shot's real coverage (`blender: framing ...`). |
+| `blender_3d.py`, `hunyuan3d_client.py`, `_hy3dgen_run.py` | `[3D_ORBIT]`: still → Hunyuan3D-2mv mesh → eased Blender orbit over the blurred still (see *3D orbit setup*). |
+| `stock_stills.py` | Stock stand-in images for the automated runner when Flow fails (reported as stand-ins, never as successes). |
+| `render_storyboard.py`, `remotion/` | The older Remotion Ken Burns renderer (`--engine remotion`). |
 
 ## Configuration (env vars)
 
 | Var | Default | Meaning |
 |---|---|---|
-| `FLOW_PROFILE_DIR` | `F:\code\video-flow\profiles\flow` | Chrome profile used by the automation |
+| `FLOW_PROFILE_DIR` | `F:\code\video-flow\profiles\flow` | Chrome profile used for the URL import |
 | `FLOW_OUTPUT_DIR` | `F:\code\video-flow\output` | Staging for downloaded assets |
-| `FLOW_TARGET_DIR` | `F:\videos\google-flow-videos` | Default `--target` for batch runs |
+| `FLOW_TARGET_DIR` | `F:\videos\google-flow-videos` | Default `--target` |
 | `FLOW_TTS_VOICE` | `en-US-ChristopherNeural` | Edge-TTS voice |
-| `FLOW_BUSY_MARKERS` | the video-studio project's Flow profile | Semicolon-separated chrome command-line markers for the passive monitor |
-
-## Busy monitor
-
-`wait_until_flow_free()` scans `chrome.exe` command lines (PowerShell CIM) for
-Flow automation profile markers and pauses (up to 15 min) while another
-automation is driving Flow. Our own profile is always excluded — it can never
-deadlock against itself. Manual browsing in a normal Chrome window is not
-detected.
+| `FLOW_TTS_GAP_S` | `3` | Seconds of silence for a scene without narration |
+| `FLOW_BLENDER` | Blender 5.2 install | Path to `blender.exe` |
+| `FLOW_BUSY_MARKERS` | the video-studio project's Flow profile | Chrome command-line markers for the passive busy monitor |
 
 ## Usage
 
@@ -37,19 +40,26 @@ detected.
 # sign-in / profile check (submits nothing, spends nothing)
 python flow_generate.py --check
 
-# batch-generate stills into the target folder as scene_NN.jpg
-python flow_generate.py episode_01.txt --target "F:\videos\google-flow-videos" --skip-existing
+# batch text for the scenes that need assets -> agent_batch.txt + scenes_todo.json (+ clipboard)
+python flow_generate.py episode_01.txt --target "F:\videos\google-flow-videos" --prepare-batch
 
-# synthesize narration
+# import from a Flow project (same Google account as profiles\flow)
+python flow_generate.py episode_01.txt --target "F:\videos\google-flow-videos" --import-batch --project-url https://flow.google.com/project/...
+
+# import from a folder of downloads named in scene order (01.jpg, 02.mp4, ...) - any account
+python flow_generate.py episode_01.txt --target "F:\videos\google-flow-videos" --import-batch --from-folder D:\downloads\episode_01
+
+# voice a TTS script (one line per scene) -> narration.mp3 + narration.mp3.meta.json
 python tts.py narration_script.txt narration.mp3
 
-# render a storyboard json directly
-python render_storyboard.py storyboard.json out.mp4
+# render one still with one shot type (smoke test)
+python blender_motion.py still.jpg out.mp4 establishing
 ```
 
-Prompts `.txt` format: one scene per paragraph; a trailing `NARRATION: <text>`
-per paragraph is narration, not prompt. `--skip-existing` keeps existing
-`scene_NN.jpg` files (resume).
+Imports map images to still scenes and clips to `[VIDEO]` scenes; a
+shortfall maps nothing, and a folder file of the wrong kind for its position
+stops the import. The command-line imports do not write the GUI's storyboard
+or voice the narration — the GUI's *Import Flow stills* does.
 
 ## 3D orbit setup ([3D_ORBIT] scenes)
 

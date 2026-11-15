@@ -838,7 +838,9 @@ def main():
         sys.exit(1)
     if prompts_file.suffix.lower() == ".txt":
         prompts = parse_prompts_text(raw)
-        fa.log(f"parsed {len(prompts)} prompt(s) from paragraphs (images only)")
+        n_vid = sum(1 for p in prompts if p.get("mode") == "video")
+        fa.log(f"parsed {len(prompts)} scene(s) from paragraphs"
+               + (f" ({n_vid} [VIDEO])" if n_vid else ""))
     else:
         try:
             prompts = json.loads(raw)
