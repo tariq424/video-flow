@@ -28,8 +28,11 @@ import os
 import sys
 import json
 import glob
+import math
 import subprocess
 import shutil
+
+math_ceil = math.ceil
 
 
 BLENDER_CANDIDATES = [
@@ -39,10 +42,13 @@ BLENDER_CANDIDATES = [
     r"C:\Program Files\Blender Foundation\Blender 4.2\blender.exe",
 ]
 
-# the shot list - cycled in scene order; 8 scenes get 8 different shots
+# the shot list - cycled per SUB-SHOT; long scenes are cut into several
+# sub-shots with HARD CUTS between them (a 47s scene with one slow move
+# reads as "a zoomed image drifting" - cuts are what make shots visible)
 SHOTS = ["establishing", "dolly-close", "tracking-pan", "zoom-tele",
          "top-view", "low-angle", "crane-down", "hero-push"]
 
+SUB_SHOT_MAX_S = 14      # one designed shot lasts at most this long
 UPSCALE_WIDTH = 2880
 
 BPY_TEMPLATE = r'''
@@ -195,107 +201,183 @@ def find_blender():
 
 
 def render_blender_storyboard(scenes, timeline_out, width=1920, height=1080, fps=30):
-    """scenes: [{"image", "duration"}] -> one designed shot per scene, H.264
-    per scene, concatenated into timeline_out. Raises RuntimeError with the
-    failure reason when Blender is missing or fails."""
+    """scenes: [{"image", "duration", "mode"?, "video"?}] -> per-scene clips
+    concatenated into timeline_out.
+
+    Modes:
+      blender (default) - the still is cut into SUB-SHOTS of <= SUB_SHOT_MAX_S
+        with HARD CUTS between designed shots (wide -> dolly -> tele ...),
+        so the camera language is visible even on long scenes
+      3d_orbit - the still goes through Hunyuan3D -> Blender orbit composited
+        over the static still; ANY failure falls back to the blender path
+      video - scenes["video"] (scene_NN.mp4) is normalized and spliced as-is
+
+    Raises RuntimeError with the failure reason when Blender is missing or a
+    mandatory stage fails."""
     blender = find_blender()
     if not blender:
-        raise RuntimeError("blender.exe not found - set FLOW_BLENDER to the exe path")
+        raise RuntimeError("blender.exe not found - set FLOW_BLENDER")
 
     out_dir = os.path.join(os.path.dirname(timeline_out), "blender_work")
     os.makedirs(out_dir, exist_ok=True)
     for old in glob.glob(os.path.join(out_dir, "motion_scene_*.mp4")):
         os.remove(old)
 
-    cfg_scenes = []
+    # upscale pool: every unique still once
+    upscaled_map = {}
     for i, s in enumerate(scenes, 1):
-        frames = max(int(round(float(s["duration"]) * fps)), fps // 2)
-        cfg_scenes.append({"image": os.path.abspath(s["image"]), "frames": frames,
-                           "shot": SHOTS[(i - 1) % len(SHOTS)], "n": i})
-
-    # pre-upscale every still (lanczos + light sharpen) so the camera only
-    # ever minifies - the #1 defense against soft output
-    upscaled = 0
-    for sc in cfg_scenes:
-        up = os.path.join(out_dir, f"up_{sc['n']:02d}.jpg")
-        if not os.path.isfile(up):
-            r = subprocess.run(
-                ["ffmpeg", "-y", "-loglevel", "error", "-i", sc["image"],
-                 "-vf", f"scale={UPSCALE_WIDTH}:-2:flags=lanczos,"
-                        f"unsharp=5:5:0.4:3:3:0.0",
-                 "-q:v", "2", up],
-                capture_output=True, text=True)
-            if r.returncode != 0 or not os.path.isfile(up):
-                print(f"blender: upscale failed for scene {sc['n']} "
-                      f"({r.stderr[:120]}) - using the original still")
-                continue
-            upscaled += 1
-        sc["image"] = up
-    print(f"blender: {upscaled}/{len(cfg_scenes)} still(s) upscaled to "
+        src = os.path.abspath(s["image"])
+        if src in upscaled_map:
+            continue
+        up = os.path.join(out_dir, f"up_{i:02d}.jpg")
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", src,
+             "-vf", f"scale={UPSCALE_WIDTH}:-2:flags=lanczos,"
+                    f"unsharp=5:5:0.4:3:3:0.0",
+             "-q:v", "2", up],
+            capture_output=True, text=True)
+        upscaled_map[src] = up if (r.returncode == 0 and os.path.isfile(up)) else src
+    print(f"blender: {len(upscaled_map)} still(s) upscaled to "
           f"{UPSCALE_WIDTH}px (sharpened)")
 
-    cfg_path = os.path.join(out_dir, "blender_cfg.json")
-    with open(cfg_path, "w", encoding="utf-8") as f:
-        json.dump({"scenes": cfg_scenes, "out_dir": out_dir,
-                   "width": width, "height": height, "fps": fps}, f, indent=1)
-    bpy_path = os.path.join(out_dir, "blender_build.py")
-    with open(bpy_path, "w", encoding="utf-8") as f:
-        f.write(BPY_TEMPLATE)
+    # plan: (kind, payload) per output part, in timeline order
+    plan = []            # [("shots", cfg_scene), ("file", path)]
+    shot_cursor = 0
+    for i, s in enumerate(scenes, 1):
+        frames = max(int(round(float(s["duration"]) * fps)), fps // 2)
+        mode = (s.get("mode") or "blender").lower()
+        image = upscaled_map.get(os.path.abspath(s["image"]),
+                                 os.path.abspath(s["image"]))
 
-    total_frames = sum(s["frames"] for s in cfg_scenes)
-    print(f"blender: {blender}")
-    shot_plan = ", ".join(f"{s['n']}:{s['shot']}" for s in cfg_scenes)
-    print(f"blender: shot plan -> {shot_plan}")
-    print(f"blender: {len(cfg_scenes)} scene(s), {total_frames} frames total "
-          f"@ {fps}fps ({total_frames / fps:.2f}s)")
-    proc = subprocess.Popen(
-        [blender, "-b", "--python", bpy_path, "--", cfg_path],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        cwd=out_dir, text=True, encoding="utf-8", errors="replace")
-    done_scenes = 0
-    for line in proc.stdout:
-        line = line.rstrip()
-        if line.startswith("BLENDER_SCENE_DONE"):
-            done_scenes += 1
-            print(f"blender: scene {line.split()[1]} rendered ({done_scenes}/"
-                  f"{len(cfg_scenes)})", flush=True)
-        elif line.startswith("Fra:"):
-            continue                      # per-frame spam - keep the log tight
-    proc.wait()
-    if proc.returncode != 0:
-        raise RuntimeError(f"blender exited {proc.returncode} "
-                           f"({done_scenes}/{len(cfg_scenes)} scenes rendered)")
+        if mode == "3d_orbit":
+            print(f"scene {i:02d}: [3D_ORBIT] {frames} frames "
+                  f"({frames / fps:.1f}s)")
+            try:
+                from hunyuan3d_client import image_to_mesh, describe_backend
+                glb = os.path.join(out_dir, f"mesh_{i:02d}.glb")
+                image_to_mesh(s["image"], glb, timeout_s=int(
+                    os.environ.get("FLOW_3D_TIMEOUT", "1200")))
+                from blender_3d import render_3d_orbit
+                part = os.path.join(out_dir, f"motion_scene_{i:02d}.mp4")
+                render_3d_orbit(glb, image, part, frames / fps,
+                                width=width, height=height, fps=fps)
+                plan.append(("file", part))
+                continue
+            except Exception as e:
+                print(f"scene {i:02d}: 3D ORBIT FAILED ({str(e)[:160]}) - "
+                      f"falling back to the 2.5D shot list", flush=True)
 
-    # encode each scene's JPEG sequence to H.264, then clean the frames away
-    parts = []
-    for idx, sc in enumerate(cfg_scenes):
-        k = sc["n"]
-        frames_dir = os.path.join(out_dir, "frames_%02d" % k)
-        seq = sorted(glob.glob(os.path.join(frames_dir, "frame_*.jpg")))
-        if len(seq) < sc["frames"] - 1:
-            raise RuntimeError(f"scene {k}: blender produced {len(seq)} of "
-                               f"{sc['frames']} frames")
-        part = os.path.join(out_dir, f"motion_scene_{k:02d}.mp4")
-        r = subprocess.run(["ffmpeg", "-y", "-loglevel", "error",
-                            "-framerate", str(fps),
-                            "-i", os.path.join(frames_dir, "frame_%04d.jpg"),
-                            # Blender 5.2's new OCIO config darkens ~15%
-                            # (out ~= in^1.15) even under the Standard view
-                            # transform; ffmpeg eq gamma brightens as ^(1/g),
-                            # so 1.15 restores the source luma
-                            "-vf", "eq=gamma=1.15",
-                            "-c:v", "libx264", "-preset", "slow", "-crf", "17",
-                            "-pix_fmt", "yuv420p", part],
-                           capture_output=True, text=True)
-        if r.returncode != 0 or not os.path.isfile(part):
-            raise RuntimeError(f"scene {k} encode failed: {r.stderr[:300]}")
-        parts.append(part)
-        shutil.rmtree(frames_dir, ignore_errors=True)
+        if mode == "video":
+            vp = s.get("video")
+            if vp and os.path.isfile(vp):
+                part = os.path.join(out_dir, f"motion_scene_{i:02d}.mp4")
+                r = subprocess.run(
+                    ["ffmpeg", "-y", "-loglevel", "error", "-i", vp,
+                     "-vf", f"scale={width}:{height}:force_original_aspect_ratio="
+                            f"decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
+                            f"fps={fps}",
+                     "-frames:v", str(frames),
+                     "-c:v", "libx264", "-preset", "slow", "-crf", "17",
+                     "-pix_fmt", "yuv420p", part],
+                    capture_output=True, text=True)
+                if r.returncode == 0 and os.path.isfile(part):
+                    print(f"scene {i:02d}: [VIDEO] spliced {os.path.basename(vp)}")
+                    plan.append(("file", part))
+                    continue
+                print(f"scene {i:02d}: video splice failed ({r.stderr[:120]}) "
+                      "- falling back to the 2.5D shot list")
+            else:
+                print(f"scene {i:02d}: [VIDEO] tag but no scene_{i:02d}.mp4 "
+                      "found - falling back to the 2.5D shot list")
 
-    # same encoder settings everywhere -> plain concat with -c copy is safe
+        # blender sub-shots: hard cuts every <= SUB_SHOT_MAX_S
+        n_sub = max(1, math_ceil(frames / (SUB_SHOT_MAX_S * fps)))
+        base = frames // n_sub
+        extra = frames - base * n_sub
+        print(f"scene {i:02d}: [BLENDER] {n_sub} shot(s) x ~"
+              f"{base / fps:.1f}s")
+        for j in range(n_sub):
+            f = base + (1 if j < extra else 0)
+            shot = SHOTS[shot_cursor % len(SHOTS)]
+            shot_cursor += 1
+            plan.append(("shots", {"image": image, "frames": f,
+                                   "shot": shot, "n": len(plan) + 1}))
+
+    # render every "shots" part via one Blender pass
+    cfg_scenes = [p[1] for p in plan if p[0] == "shots"]
+    if cfg_scenes:
+        cfg_path = os.path.join(out_dir, "blender_cfg.json")
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump({"scenes": cfg_scenes, "out_dir": out_dir,
+                       "width": width, "height": height, "fps": fps}, f, indent=1)
+        bpy_path = os.path.join(out_dir, "blender_build.py")
+        with open(bpy_path, "w", encoding="utf-8") as f:
+            f.write(BPY_TEMPLATE)
+
+        total_frames = sum(s["frames"] for s in cfg_scenes)
+        print(f"blender: {blender}")
+        print("blender: shot plan -> " +
+              ", ".join(f"{s['n']}:{s['shot']}" for s in cfg_scenes))
+        print(f"blender: {len(cfg_scenes)} sub-shot(s), {total_frames} frames "
+              f"@ {fps}fps ({total_frames / fps:.2f}s)")
+        proc = subprocess.Popen(
+            [blender, "-b", "--python", bpy_path, "--", cfg_path],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            cwd=out_dir, text=True, encoding="utf-8", errors="replace")
+        done_scenes = 0
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line.startswith("BLENDER_SCENE_DONE"):
+                done_scenes += 1
+                print(f"blender: shot {line.split()[1]} rendered "
+                      f"({done_scenes}/{len(cfg_scenes)})", flush=True)
+            elif line.startswith("Fra:"):
+                continue                  # per-frame spam - keep the log tight
+        proc.wait()
+        if proc.returncode != 0:
+            raise RuntimeError(f"blender exited {proc.returncode} "
+                               f"({done_scenes}/{len(cfg_scenes)} shots rendered)")
+
+        # encode each sub-shot's JPEG sequence, then clean the frames away
+        for sc in cfg_scenes:
+            k = sc["n"]
+            frames_dir = os.path.join(out_dir, "frames_%02d" % k)
+            seq = sorted(glob.glob(os.path.join(frames_dir, "frame_*.jpg")))
+            if len(seq) < sc["frames"] - 1:
+                raise RuntimeError(f"shot {k}: blender produced {len(seq)} of "
+                                   f"{sc['frames']} frames")
+            part = os.path.join(out_dir, f"motion_shot_{k:02d}.mp4")
+            r = subprocess.run(["ffmpeg", "-y", "-loglevel", "error",
+                                "-framerate", str(fps),
+                                "-i", os.path.join(frames_dir, "frame_%04d.jpg"),
+                                # Blender 5.2's new OCIO config darkens ~15%
+                                # (out ~= in^1.15) even under the Standard view
+                                # transform; ffmpeg eq gamma brightens as
+                                # ^(1/g), so 1.15 restores the source luma
+                                "-vf", "eq=gamma=1.15",
+                                "-c:v", "libx264", "-preset", "slow", "-crf", "17",
+                                "-pix_fmt", "yuv420p", part],
+                               capture_output=True, text=True)
+            if r.returncode != 0 or not os.path.isfile(part):
+                raise RuntimeError(f"shot {k} encode failed: {r.stderr[:300]}")
+            shutil.rmtree(frames_dir, ignore_errors=True)
+
+    # assemble the timeline in PLAN order: sub-shot clips and spliced
+    # files/orbits interleaved exactly as planned
+    ordered = []
+    for kind, payload in plan:
+        if kind == "file":
+            ordered.append(payload)
+        else:
+            ordered.append(os.path.join(out_dir,
+                                        f"motion_shot_{payload['n']:02d}.mp4"))
+    missing = [p for p in ordered if not os.path.isfile(p)]
+    if missing:
+        raise RuntimeError(f"{len(missing)} timeline part(s) missing: "
+                           f"{[os.path.basename(m) for m in missing][:5]}")
     list_path = os.path.join(out_dir, "concat_motion.txt")
     with open(list_path, "w", encoding="utf-8") as f:
-        for p in parts:
+        for p in ordered:
             f.write("file '" + p.replace("\\", "/") + "'\n")
     r = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat",
                         "-safe", "0", "-i", list_path, "-c", "copy", timeline_out],

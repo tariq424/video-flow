@@ -215,16 +215,73 @@ def open_project_session(target):
     return True
 
 
-def import_batch(prompts, target, project_url=None):
-    """Manual-assist step 3: read the generated images from a Flow project and
-    map them to scene_NN.jpg in DOM (chronological) order.
+def _import_from_folder(prompts, target, folder):
+    """Folder import: images sorted by filename map to scene_01..NN with
+    provenance. Order = filename order - the user controls it by naming."""
+    d = Path(folder)
+    if not d.is_dir():
+        fa.log(f"folder not found: {folder}")
+        return False
+    files = [f for f in sorted(d.iterdir())
+             if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")
+             and f.is_file()]
+    if not files:
+        fa.log(f"no images in {folder}")
+        return False
+    todo_path = Path(target) / "scenes_todo.json"
+    if todo_path.is_file():
+        todo = json.loads(todo_path.read_text(encoding="utf-8"))
+    else:
+        todo = [{"n": i, "hash": _prompt_hash(fa.sanitize_prompt(str(it.get("prompt", "")).strip()))}
+                for i, it in enumerate(prompts, 1)]
+    n_expected = len(todo)
+    fa.log(f"folder import: {len(files)} image(s) found in {folder} "
+           f"({n_expected} scene(s) expected)")
+    if len(files) < n_expected:
+        fa.log(f"IMPORT INCOMPLETE: {n_expected - len(files)} image(s) short - "
+               f"nothing mapped. Name the files so sort order = scene order.")
+        return False
+    if len(files) > n_expected:
+        fa.log(f"mapping the FIRST {n_expected} in filename order")
+        files = files[:n_expected]
+    target_path = Path(target)
+    meta = _load_meta(target_path)
+    saved = []
+    for s, src in zip(todo, files):
+        n, ph = s["n"], s["hash"]
+        data = src.read_bytes()
+        if not data or not fa.is_image(data):
+            fa.log(f"[{n:02d}] FAILED - {src.name} is not a valid image")
+            continue
+        dest = target_path / f"scene_{n:02d}.jpg"
+        dest.write_bytes(data)
+        meta[dest.name] = {"prompt_hash": ph, "source": "flow-folder",
+                           "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
+        fa.log(f"[{n:02d}] SAVED <- {src.name} ({len(data) // 1024} KB)")
+        saved.append(n)
+    _save_meta(target_path, meta)
+    missing = [s["n"] for s in todo if s["n"] not in saved]
+    if missing:
+        fa.log(f"VALIDATION: scene(s) missing after folder import: {missing}")
+        return False
+    fa.log(f"VALIDATION PASSED: {len(saved)} scene(s) imported from folder")
+    return True
 
-    project_url: the URL the user pasted into (any window, same account) -
-    overrides the recorded baseline URL. When the URL does not match the
-    baseline (or no baseline exists), ALL images visible in the project are
-    the candidate set - designed for a BRAND-NEW project where every image
-    belongs to the paste. On a count mismatch nothing is mapped (order would
-    be guesswork) - the user generates the rest and re-imports."""
+
+def import_batch(prompts, target, project_url=None, from_folder=None):
+    """Manual-assist step 3: map generated images to scene_NN.jpg.
+
+    from_folder: a LOCAL directory of downloaded images (named so their sort
+    order = scene order, e.g. 01.jpg..09.jpg) - completely decouples the
+    import from browser accounts; the user can download from any account and
+    drop the files in a folder.
+    project_url: the Flow project URL to read via the automation browser
+    (same Google account as the profile). Order = DOM order, which Flow does
+    NOT guarantee to be submission order - the folder path is safer when
+    order matters. On a count mismatch nothing is mapped (order would be
+    guesswork) - generate the rest and re-import."""
+    if from_folder:
+        return _import_from_folder(prompts, target, from_folder)
     base_path = Path(target) / "import_baseline.json"
     base = json.loads(base_path.read_text(encoding="utf-8")) if base_path.is_file() else {}
     todo_path = Path(target) / "scenes_todo.json"
@@ -590,6 +647,18 @@ def parse_prompts_text(text):
                 pending.append(narration)
             continue
         item = {"type": "image", "prompt": visual}
+        # render-mode tags: [3D_ORBIT] (image -> Hunyuan3D mesh -> orbiting
+        # camera), [BLENDER] (standard 2.5D shot list), [VIDEO] (the user
+        # generates a Flow video clip for this scene; it is spliced as-is).
+        # Default (no tag) = [BLENDER]. The tag is stripped from the prompt
+        # and never sent to Flow.
+        item["mode"] = "blender"
+        for tag, mode in (("[3D_ORBIT]", "3d_orbit"), ("[BLENDER]", "blender"),
+                          ("[VIDEO]", "video")):
+            if tag.lower() in (visual or "").lower():
+                item["mode"] = mode
+                visual = re.sub(re.escape(tag), "", visual, flags=re.I).strip()
+        item["prompt"] = visual
         parts = pending + ([narration] if narration else [])
         if parts:
             item["narration"] = " ".join(parts)
@@ -658,7 +727,14 @@ def main():
     if "--open-project" in argv:
         sys.exit(0 if open_project_session(target) else 1)
     if "--import-batch" in argv:
-        sys.exit(0 if import_batch(prompts, target, project_url=project_url) else 1)
+        folder = None
+        if "--from-folder" in argv:
+            k = argv.index("--from-folder")
+            if k + 1 < len(argv):
+                folder = argv[k + 1]
+                argv = argv[:k] + argv[k + 2:]
+        sys.exit(0 if import_batch(prompts, target, project_url=project_url,
+                                   from_folder=folder) else 1)
 
     if "--agent-batch" in argv:
         # programmatic Agent batch: ONE submission generates all scene stills
