@@ -279,10 +279,11 @@ def render_blender_storyboard(scenes, timeline_out, width=1920, height=1080, fps
         r = subprocess.run(["ffmpeg", "-y", "-loglevel", "error",
                             "-framerate", str(fps),
                             "-i", os.path.join(frames_dir, "frame_%04d.jpg"),
-                            # Blender 5.2's new OCIO config applies ~gamma 1.15
-                            # even under the Standard view transform (measured
-                            # per-channel fit); 0.87 restores the source luma
-                            "-vf", "eq=gamma=0.87",
+                            # Blender 5.2's new OCIO config darkens ~15%
+                            # (out ~= in^1.15) even under the Standard view
+                            # transform; ffmpeg eq gamma brightens as ^(1/g),
+                            # so 1.15 restores the source luma
+                            "-vf", "eq=gamma=1.15",
                             "-c:v", "libx264", "-preset", "slow", "-crf", "17",
                             "-pix_fmt", "yuv420p", part],
                            capture_output=True, text=True)
