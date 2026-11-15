@@ -8,14 +8,20 @@ The camera is a real perspective camera over the still as a textured plane,
 so pans show parallax (near edges sweep faster than the far edge) and the
 dolly moves have true depth.
 
-FRAMING CONTRACT: distances are fractions OF THE IMAGE (not of the oversized
-plane). zdist(f) places the camera so exactly f of the image width is in
-frame: 0.98 = nearly the whole picture, 0.60 = a genuine close-up. The plane
-carries 1.42x overscan so pans/tilts never reveal edges.
+FRAMING CONTRACT: the plane IS the image (same aspect, no overscan).
+zdist(f) places the camera so the frame spans f of the full-fit framing:
+1.00 = the whole picture, 0.60 = a close-up. Every start/end keyframe goes
+through safe(), which projects the real frame corners (lens + tilt + yaw)
+onto the plane and pulls the camera in until no edge can show. Each shot's
+actual coverage is logged as "blender: framing ...".
 
-Sharpness: stills are pre-upscaled to UPSCALE_WIDTH (lanczos + light
-sharpen) because Flow stills (1632x912) are below 1080p and camera moves
-magnify. After upscaling, max on-screen magnification is ~1.02x.
+(Before 2026-11-14 the plane's half-width was mistaken for its width and
+the texture was stretched over a 1.42x "overscan" plane, so a "98%" wide
+shot really showed ~35% of the picture at ~4x blow-up.)
+
+Sharpness: Flow stills are ~1376x768, below 1080p. Upscaling (lanczos +
+light sharpen) adds no detail - a 60% close-up is a ~2.3x blow-up of the
+source. Use Flow's 2K download for sharper close-ups.
 
     render_blender_storyboard(scenes, timeline_out, width, height, fps)
         scenes: [{"image": abs_path, "duration": seconds}]
@@ -81,21 +87,61 @@ cam = bpy.data.objects.new("cam", cam_data)
 scene.collection.objects.link(cam)
 scene.camera = cam
 
-IMG_W, IMG_H = 1.6, 0.9
-OVER = 1.42                       # plane overscan (pans/tilts never show edges)
-Z2W = 2.0 * math.tan(math.radians(19.8))   # 50mm lens: visible width = z * Z2W
+from mathutils import Euler, Vector
 
-def zdist(frac):
-    """camera height placing exactly `frac` of the IMAGE width in frame"""
-    return IMG_W * frac / Z2W
+ASPECT = cfg["width"] / cfg["height"]
+SENSOR_W = 36.0                   # Blender default; sensor_fit AUTO = horizontal for 16:9
+cam_data.sensor_width = SENSOR_W
+cam_data.sensor_fit = "HORIZONTAL"
+HW = 0.8                          # plane half-width; the plane IS the image, no overscan
+
+def footprint(loc, rot, lens):
+    """the 4 frame corners projected onto the image plane (z=0)"""
+    m = Euler(rot, "XYZ").to_matrix()
+    sw, sh = SENSOR_W / 2.0, SENSOR_W / ASPECT / 2.0
+    pts = []
+    for dx, dy in ((-sw, -sh), (sw, -sh), (sw, sh), (-sw, sh)):
+        d = m @ Vector((dx, dy, -lens))
+        if d.z >= -1e-6:
+            return None           # ray never hits the plane
+        t = -loc[2] / d.z
+        pts.append((loc[0] + t * d.x, loc[1] + t * d.y))
+    return pts
+
+def inside(loc, rot, lens):
+    pts = footprint(loc, rot, lens)
+    return pts is not None and all(abs(x) <= HW + 1e-6 and abs(y) <= HH + 1e-6
+                                   for x, y in pts)
+
+def safe(loc, rot, lens):
+    """pull the camera toward centre / down until the frame stays on the image"""
+    x, y, z = loc
+    for _ in range(400):
+        if inside((x, y, z), rot, lens):
+            return (x, y, z)
+        x, y, z = x * 0.95, y * 0.95, z * 0.99
+    return (0.0, 0.0, z)
+
+def coverage(loc, rot, lens):
+    """fraction of the image WIDTH the frame spans (for the log)"""
+    pts = footprint(loc, rot, lens) or [(0, 0)]
+    xs = [p[0] for p in pts]
+    return (max(xs) - min(xs)) / (2 * HW)
 
 OUT = cfg["out_dir"]
 for k, sc in enumerate(cfg["scenes"], 1):
     img = bpy.data.images.load(sc["image"])
     iw, ih = img.size
 
-    cover = 1.0 * max(cfg["width"] / cfg["height"] / (iw / ih), 1.0)
-    pw, ph = IMG_W * OVER * cover, IMG_H * OVER * cover
+    HH = HW * ih / iw                         # plane keeps the image's own aspect
+    IMG_W, IMG_H = 2 * HW, 2 * HH
+    FIT_W = min(IMG_W, IMG_H * ASPECT)        # widest frame that stays on the image
+
+    def zdist(frac, lens=50.0):
+        """camera height showing `frac` of the full-fit framing (1.0 = whole picture)"""
+        return FIT_W * frac * lens / SENSOR_W
+
+    pw, ph = HW, HH
     mesh = bpy.data.meshes.new("plane%02d" % k)
     mesh.from_pydata([(-pw, -ph, 0), (pw, -ph, 0), (pw, ph, 0), (-pw, ph, 0)],
                      [], [(0, 1, 2, 3)])
@@ -118,6 +164,10 @@ for k, sc in enumerate(cfg["scenes"], 1):
     f0, f1 = 1, sc["frames"]
     shot = sc["shot"]
 
+    # the camera is shared by every shot: drop the previous shot's keyframes,
+    # or its lens zoom / tilt fcurves silently override this shot's values
+    cam.animation_data_clear()
+    cam_data.animation_data_clear()
     cam_data.lens = 50
     cam.location = (0.0, 0.0, zdist(0.95))
     cam.rotation_euler = (0.0, 0.0, 0.0)
@@ -125,41 +175,60 @@ for k, sc in enumerate(cfg["scenes"], 1):
     f_end_rot = None
     f_end_lens = None
 
+    # every offset is a fraction of the IMAGE half-size; every distance a
+    # fraction of the full-fit framing. safe() then guarantees no edge shows.
     if shot == "establishing":
-        # nearly the whole picture, slow push to settle the framing
-        cam.location = (0.0, 0.0, zdist(0.98)); f_end_loc = (0.0, 0.0, zdist(0.86))
+        # the whole picture, slow push to settle the framing
+        cam.location = (0.0, 0.0, zdist(1.00)); f_end_loc = (0.0, 0.0, zdist(0.85))
     elif shot == "dolly-close":
-        # genuine dolly: wide three-quarter start -> real close-up on a region
-        cam.location = (-IMG_W * 0.12, IMG_H * 0.10, zdist(0.92))
-        f_end_loc = (IMG_W * 0.10, -IMG_H * 0.06, zdist(0.56))
+        # wide three-quarter start -> close-up on a region (60% of the frame)
+        cam.location = (-HW * 0.06, HH * 0.04, zdist(0.95))
+        f_end_loc = (HW * 0.25, -HH * 0.20, zdist(0.60))
     elif shot == "tracking-pan":
-        # lateral track across the image
-        xmax = IMG_W * (1 - 0.80) * 0.45
-        cam.location = (-xmax, 0.0, zdist(0.80)); f_end_loc = (xmax, 0.0, zdist(0.80))
+        # lateral track edge to edge at 70% framing
+        xmax = HW * (1 - 0.70)
+        cam.location = (-xmax, 0.0, zdist(0.70)); f_end_loc = (xmax, 0.0, zdist(0.70))
     elif shot == "zoom-tele":
-        # TRUE zoom: optics change, camera does not move
-        cam.location = (IMG_W * 0.06, -IMG_H * 0.04, zdist(0.95))
-        cam_data.lens = 38; f_end_lens = 88
+        # TRUE zoom: optics change, camera does not move (whole frame -> 60%)
+        cam_data.lens = 38
+        cam.location = (HW * 0.05, -HH * 0.05, zdist(1.00, 38))
+        f_end_lens = 38 / 0.60
     elif shot == "top-view":
         # flat, head-on: the still as-is, slow settle
-        cam.location = (0.0, 0.0, zdist(1.00)); f_end_loc = (0.0, 0.0, zdist(0.90))
+        cam.location = (0.0, 0.0, zdist(1.00)); f_end_loc = (0.0, 0.0, zdist(0.92))
     elif shot == "low-angle":
         # camera low, pitched up: keystone perspective, "billboard from below"
-        cam.location = (IMG_W * 0.05, -IMG_H * 0.55, zdist(0.88))
-        cam.rotation_euler = (math.radians(6.0), 0.0, 0.0)
-        f_end_loc = (-IMG_W * 0.04, -IMG_H * 0.30, zdist(0.72))
-        f_end_rot = (math.radians(1.5), 0.0, 0.0)
+        cam.location = (HW * 0.05, -HH * 0.45, zdist(0.70))
+        cam.rotation_euler = (math.radians(10.0), 0.0, 0.0)
+        f_end_loc = (-HW * 0.05, -HH * 0.15, zdist(0.70))
+        f_end_rot = (math.radians(3.0), 0.0, 0.0)
     elif shot == "crane-down":
-        ym = IMG_H * (1 - 0.78) * 0.45
-        cam.location = (0.0, ym, zdist(0.78)); f_end_loc = (0.0, -ym, zdist(0.78))
+        # vertical move top -> bottom at 70% framing
+        ym = HH * (1 - 0.70)
+        cam.location = (0.0, ym, zdist(0.70)); f_end_loc = (0.0, -ym, zdist(0.70))
     elif shot == "hero-push":
-        # low three-quarter hero: offset, pitched, pushing in
-        cam.location = (IMG_W * 0.10, -IMG_H * 0.12, zdist(0.88))
-        cam.rotation_euler = (math.radians(4.0), 0.0, math.radians(-2.0))
-        f_end_loc = (IMG_W * 0.04, -IMG_H * 0.04, zdist(0.64))
-        f_end_rot = (math.radians(1.0), 0.0, math.radians(-0.5))
+        # low three-quarter hero: offset, pitched, yawed, pushing in
+        cam.location = (HW * 0.06, -HH * 0.10, zdist(0.72))
+        cam.rotation_euler = (math.radians(5.0), 0.0, math.radians(-2.5))
+        f_end_loc = (HW * 0.05, -HH * 0.05, zdist(0.50))
+        f_end_rot = (math.radians(2.0), 0.0, math.radians(-1.0))
     else:
         cam.location = (0.0, 0.0, zdist(0.95)); f_end_loc = (0.0, 0.0, zdist(0.80))
+
+    lens0 = cam_data.lens
+    lens1 = f_end_lens if f_end_lens is not None else lens0
+    rot0 = tuple(cam.rotation_euler)
+    rot1 = f_end_rot if f_end_rot is not None else rot0
+    cam.location = safe(tuple(cam.location), rot0, lens0)
+    if f_end_loc is not None:
+        f_end_loc = safe(f_end_loc, rot1, lens1)
+    end_for_log = f_end_loc if f_end_loc is not None else tuple(cam.location)
+    if f_end_loc is None and f_end_lens is not None:
+        if not inside(end_for_log, rot1, lens1):     # lens change alone can't leave the image
+            lens1 = f_end_lens = lens0
+    print("BLENDER_FRAMING %d %s start=%.0f%% end=%.0f%% of image width"
+          % (k, shot, 100 * coverage(tuple(cam.location), rot0, lens0),
+             100 * coverage(end_for_log, rot1, lens1)), flush=True)
 
     cam.keyframe_insert(data_path="location", frame=f0)
     if f_end_loc is not None:
@@ -183,6 +252,8 @@ for k, sc in enumerate(cfg["scenes"], 1):
     bpy.ops.render.render(animation=True)
     print("BLENDER_SCENE_DONE %d frames=%d dir=%s"
           % (k, f1 - f0 + 1, frames_dir), flush=True)
+    # this shot's plane must not overlap (z-fight with) the next shot's
+    bpy.data.objects.remove(obj, do_unlink=True)
 
 json.dump({"ok": True}, open(os.path.join(OUT, "blender_done.json"), "w"))
 print("BLENDER_ALL_DONE", flush=True)
@@ -331,6 +402,8 @@ def render_blender_storyboard(scenes, timeline_out, width=1920, height=1080, fps
                 done_scenes += 1
                 print(f"blender: shot {line.split()[1]} rendered "
                       f"({done_scenes}/{len(cfg_scenes)})", flush=True)
+            elif line.startswith("BLENDER_FRAMING"):
+                print("blender: framing " + line.split(" ", 2)[2], flush=True)
             elif line.startswith("Fra:"):
                 continue                  # per-frame spam - keep the log tight
         proc.wait()
