@@ -760,18 +760,35 @@ def neutral_prompt():
             "minimal, 16:9, photorealistic.")
 
 
+class AutomationFlagged(Blocker):
+    """Google flagged this browser session ("unusual activity", rate limit).
+    Says nothing about the prompt: never record it as a content refusal, and
+    stop the batch rather than keep sending."""
+
+
+# Google's anti-automation / rate signals - about the SESSION, not the prompt
+_AUTOMATION_MARKERS = ("unusual activity", "suspicious activity",
+                       "browser extensions that modify the page",
+                       "rate limit", "too many requests")
+
+# content refusals - about the PROMPT
 _REFUSAL_MARKERS = ("violate", "violation", "content policy", "flagged", "rejected",
                     "couldn't generate", "could not generate", "unable to generate",
                     "wasn't created", "was not created", "didn't work", "did not work",
-                    "try a different prompt", "try again with a different",
-                    "unusual activity", "may cause issues", "suspicious activity",
-                    "rate limit", "too many requests")
+                    "try a different prompt", "try again with a different")
+
+
+def _quote(txt, i):
+    return txt[max(0, i - 40): i + 200].strip().replace("\n", " ")
 
 
 def _session_refusal(page, our_text):
     """Quoted Flow refusal text when the session shows a generation rejection.
+    Raises AutomationFlagged instead when Google flagged the session itself.
     Our own prompt text is stripped first so script words like 'violation'
-    (documentary narration about war crimes) can't false-positive."""
+    (documentary narration about war crimes) can't false-positive. The quote
+    starts at the message, not 120 chars before it (that used to show only
+    toolbar icon names)."""
     for fr in page.frames:
         try:
             txt = fr.locator("body").inner_text()
@@ -780,10 +797,16 @@ def _session_refusal(page, our_text):
         if our_text:
             txt = txt.replace(our_text, " ")
         low = txt.lower()
+        for marker in _AUTOMATION_MARKERS:
+            i = low.find(marker)
+            if i != -1:
+                raise AutomationFlagged(
+                    "Google flagged this automated browser session - "
+                    "this is not a prompt refusal. Flow says: \"" + _quote(txt, i) + "\"")
         for marker in _REFUSAL_MARKERS:
             i = low.find(marker)
             if i != -1:
-                return "... " + txt[max(0, i - 120): i + 180].strip().replace("\n", " ") + " ..."
+                return "... " + _quote(txt, i) + " ..."
     return None
 
 
