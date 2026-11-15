@@ -27,3 +27,6 @@ prompts.json
 .venv3d/
 Hunyuan3D-2/
 meshes/
+
+# --- isolated Blender profile for the Blender MCP (blender_mcp_launch.py) ---
+.blender_mcp_profile/
