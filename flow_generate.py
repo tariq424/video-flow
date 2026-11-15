@@ -94,7 +94,7 @@ def _save_violated(target, data):
 
 def scene_plan(prompts):
     """The ONE scene list shared by the batch text, the import, the manifest
-    and the build: [{"n", "prompt" (sanitized - what Flow is sent), "hash",
+    and the build: [{"n", "prompt" (exactly what Flow is sent), "hash",
     "narration", "mode", "asset"}]. mode "video" scenes get a Flow video clip
     (asset scene_NN.mp4); every other scene gets a still (scene_NN.jpg)."""
     out = []
@@ -107,7 +107,8 @@ def scene_plan(prompts):
             desc = "Documentary still, photorealistic, 16:9, cinematic lighting: " + narr
         if not desc:
             continue
-        desc = fa.sanitize_prompt(desc)
+        # NOT sanitized: the manual batch sends your prompt exactly as written
+        # (the old word-swap sanitizer produced e.g. "rising from the weathered")
         mode = str(it.get("mode") or "blender").lower()
         out.append({"n": i, "prompt": desc, "hash": _prompt_hash(desc),
                     "narration": narr, "mode": mode,
@@ -142,9 +143,15 @@ def todo_records(scenes):
 
 
 VIDEO_BATCH_NOTE = (
+    "Models: generate every still image with Nano Banana. Exception - scenes "
+    "labelled (VIDEO CLIP): for each of those, use Veo to generate ONE "
+    "5-second video clip instead of an image (cinematic, 16:9, no text).")
+
+# earlier wordings - still recognised when an old batch is pasted back
+_OLD_VIDEO_NOTES = (
     "Exception - scenes labelled (VIDEO CLIP): for each of those, generate ONE "
     "short video clip instead of an image (cinematic, 16:9, slow camera "
-    "movement, no text). Every other scene is a still image as described above.")
+    "movement, no text). Every other scene is a still image as described above.",)
 
 
 def _batch_text(scenes):
@@ -726,6 +733,7 @@ def unbatch_text(text):
     norm = lambda s: " ".join(s.split()).lower()
     preamble = {norm(p) for p in re.split(r"\n\s*\n", fa.AGENT_BATCH_PREAMBLE + "\n\n"
                                            + VIDEO_BATCH_NOTE) if p.strip()}
+    preamble |= {norm(p) for p in _OLD_VIDEO_NOTES}
     blocks = [b for b in re.split(r"\n\s*\n", text) if b.strip()]
     kept = [b for b in blocks if norm(b) not in preamble]
     if len(kept) == len(blocks) and not any(_SCENE_LABEL.match(b) for b in blocks):
@@ -769,7 +777,7 @@ def parse_prompts_text(text):
         # and never sent to Flow.
         item["mode"] = "blender"
         for tag, mode in (("[3D_ORBIT]", "3d_orbit"), ("[BLENDER]", "blender"),
-                          ("[VIDEO]", "video")):
+                          ("[STILL]", "blender"), ("[VIDEO]", "video")):
             if tag.lower() in (visual or "").lower():
                 item["mode"] = mode
                 visual = re.sub(re.escape(tag), "", visual, flags=re.I).strip()
@@ -783,9 +791,23 @@ def parse_prompts_text(text):
 
 
 def narration_script(items):
-    """The narration lines, in scene order - the TTS script."""
+    """The narration lines, in scene order (scenes without narration left out)."""
     return [str(i["narration"]).strip() for i in items
             if isinstance(i, dict) and i.get("narration")]
+
+
+TTS_SILENCE = "[SILENCE]"
+
+
+def tts_lines(items):
+    """The TTS script: ONE line per scene (scene_plan order), so tts.py can
+    voice and time each scene separately; a scene without narration is a
+    [SILENCE] line (a short pause that keeps the timeline in step). [] when
+    the script has no narration at all."""
+    plan = scene_plan(items)
+    if not any(s["narration"] for s in plan):
+        return []
+    return [" ".join(s["narration"].split()) or TTS_SILENCE for s in plan]
 
 
 def main():
