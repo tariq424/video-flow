@@ -309,17 +309,19 @@ def render_blender_storyboard(scenes, timeline_out, width=1920, height=1080, fps
     # upscale pool: every unique still once
     upscaled_map = {}
     for i, s in enumerate(scenes, 1):
-        src = os.path.abspath(s["image"])
-        if src in upscaled_map:
-            continue
-        up = os.path.join(out_dir, f"up_{i:02d}.jpg")
-        r = subprocess.run(
-            ["ffmpeg", "-y", "-loglevel", "error", "-i", src,
-             "-vf", f"scale={UPSCALE_WIDTH}:-2:flags=lanczos,"
-                    f"unsharp=5:5:0.4:3:3:0.0",
-             "-q:v", "2", up],
-            capture_output=True, text=True)
-        upscaled_map[src] = up if (r.returncode == 0 and os.path.isfile(up)) else src
+        # a scene's own still plus any extra stills ([VIDEO] scenes)
+        for k, raw in enumerate([s["image"]] + list(s.get("extras") or [])):
+            src = os.path.abspath(raw)
+            if src in upscaled_map:
+                continue
+            up = os.path.join(out_dir, f"up_{i:02d}{'' if k == 0 else chr(97 + k)}.jpg")
+            r = subprocess.run(
+                ["ffmpeg", "-y", "-loglevel", "error", "-i", src,
+                 "-vf", f"scale={UPSCALE_WIDTH}:-2:flags=lanczos,"
+                        f"unsharp=5:5:0.4:3:3:0.0",
+                 "-q:v", "2", up],
+                capture_output=True, text=True)
+            upscaled_map[src] = up if (r.returncode == 0 and os.path.isfile(up)) else src
     print(f"blender: {len(upscaled_map)} still(s) upscaled to "
           f"{UPSCALE_WIDTH}px (sharpened)")
 
@@ -380,9 +382,11 @@ def render_blender_storyboard(scenes, timeline_out, width=1920, height=1080, fps
                         print(f"scene {i:02d}: [VIDEO] spliced {os.path.basename(vp)} "
                               f"({clip_frames / fps:.1f}s clip, {how})")
                         continue
+                    n_extra = len(s.get("extras") or [])
                     print(f"scene {i:02d}: [VIDEO] spliced {os.path.basename(vp)} "
                           f"({clip_frames / fps:.1f}s), then {rem / fps:.1f}s of camera "
-                          f"shots over its last frame")
+                          f"shots over " + (f"{n_extra} extra still(s)" if n_extra
+                                            else "its last frame"))
                     frames = rem
                     continue_from_clip = True
                 else:
@@ -392,20 +396,28 @@ def render_blender_storyboard(scenes, timeline_out, width=1920, height=1080, fps
                 print(f"scene {i:02d}: [VIDEO] tag but no scene_{i:02d}.mp4 "
                       "found - falling back to the 2.5D shot list")
 
+        # after a clip, the time left is covered by the scene's extra stills
+        # (one or more shots each, hard cuts between them); without extras,
+        # by camera shots over the clip's last frame
+        extras_up = [upscaled_map.get(os.path.abspath(e), os.path.abspath(e))
+                     for e in (s.get("extras") or [])] if continue_from_clip else []
+
         # blender sub-shots: hard cuts every <= SUB_SHOT_MAX_S
-        n_sub = max(1, math_ceil(frames / (SUB_SHOT_MAX_S * fps)))
+        n_sub = max(1, math_ceil(frames / (SUB_SHOT_MAX_S * fps)), len(extras_up))
+        n_sub = min(n_sub, max(1, frames // max(1, fps)))   # no shot under ~1s
         base = frames // n_sub
         extra = frames - base * n_sub
         print(f"scene {i:02d}: [BLENDER] {n_sub} shot(s) x ~"
               f"{base / fps:.1f}s")
         for j in range(n_sub):
             f = base + (1 if j < extra else 0)
-            if continue_from_clip and j == 0:
+            shot_image = extras_up[j % len(extras_up)] if extras_up else image
+            if continue_from_clip and j == 0 and not extras_up:
                 shot = "establishing"     # starts on the full frame = the clip's end
             else:
                 shot = SHOTS[shot_cursor % len(SHOTS)]
                 shot_cursor += 1
-            plan.append(("shots", {"image": image, "frames": f,
+            plan.append(("shots", {"image": shot_image, "frames": f,
                                    "shot": shot, "n": len(plan) + 1}))
 
     # render every "shots" part via one Blender pass

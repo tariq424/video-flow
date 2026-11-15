@@ -92,11 +92,46 @@ def _save_violated(target, data):
         pass
 
 
+# [VIDEO] scenes: Veo makes a ~5 s clip, but the scene lasts as long as its
+# narration. The time after the clip is covered by EXTRA STILLS of the same
+# scene (scene_NNb.jpg, scene_NNc.jpg ...), each animated with camera moves.
+CLIP_S = 5.0                # what the batch asks Veo for
+WORDS_PER_S = 2.6           # en-US-ChristopherNeural, measured on real scripts
+EXTRA_SHOT_S = 14.0         # one extra still per this much remaining time
+MAX_EXTRAS = 3
+_EXTRA_VIEWS = ("a closer view of the main subject",
+                "a wide view of the whole scene from a different angle",
+                "a quiet, still moment just after")
+
+
+def extra_still_count(narration):
+    """How many extra stills a [VIDEO] scene needs to cover its narration
+    after the clip (estimated from the word count - the batch is prepared
+    before the narration is voiced). 0 when the clip roughly fills it."""
+    rest = len(narration.split()) / WORDS_PER_S - CLIP_S
+    if rest <= 2.0:
+        return 0
+    return min(MAX_EXTRAS, max(1, int(-(-rest // EXTRA_SHOT_S))))
+
+
+def _extras_for(n, prompt, narration):
+    out = []
+    for k in range(extra_still_count(narration)):
+        suffix = "bcd"[k]
+        p = (f"{prompt.rstrip('. ')}. A still photograph of this same scene "
+             f"(not a video): {_EXTRA_VIEWS[k]}.")
+        out.append({"suffix": suffix, "prompt": p, "hash": _prompt_hash(p),
+                    "asset": f"scene_{n:02d}{suffix}.jpg"})
+    return out
+
+
 def scene_plan(prompts):
     """The ONE scene list shared by the batch text, the import, the manifest
     and the build: [{"n", "prompt" (exactly what Flow is sent), "hash",
-    "narration", "mode", "asset"}]. mode "video" scenes get a Flow video clip
-    (asset scene_NN.mp4); every other scene gets a still (scene_NN.jpg)."""
+    "narration", "mode", "asset", "extras"}]. mode "video" scenes get a Flow
+    video clip (asset scene_NN.mp4) plus "extras" - extra stills that cover
+    the narration after the clip; every other scene gets a still
+    (scene_NN.jpg) and no extras."""
     out = []
     for i, it in enumerate(prompts, 1):
         desc = str(it.get("prompt", "")).strip()
@@ -112,34 +147,51 @@ def scene_plan(prompts):
         mode = str(it.get("mode") or "blender").lower()
         out.append({"n": i, "prompt": desc, "hash": _prompt_hash(desc),
                     "narration": narr, "mode": mode,
-                    "asset": f"scene_{i:02d}.{'mp4' if mode == 'video' else 'jpg'}"})
+                    "asset": f"scene_{i:02d}.{'mp4' if mode == 'video' else 'jpg'}",
+                    "extras": _extras_for(i, desc, narr) if mode == "video" else []})
     return out
+
+
+def _is_fresh(meta, target, asset, h):
+    p = Path(target) / asset
+    rec = (meta.get(asset) or {}) if p.is_file() else {}
+    return p.is_file() and rec.get("source") != "stock" and rec.get("prompt_hash") == h
 
 
 def _manual_scenes(prompts, target, skip_existing=True):
     """The scenes the manual batch must generate (scene_plan), optionally
-    limited to scenes whose still/clip is missing, a stock stand-in, or made
-    from a different prompt."""
+    limited to the assets that are missing, a stock stand-in, or made from a
+    different prompt. Each returned scene carries "need_main" (its own still
+    or clip) and only the "extras" still needed."""
     meta = _load_meta(target)
     out = []
     for s in scene_plan(prompts):
-        i, dest = s["n"], Path(target) / s["asset"]
-        rec = (meta.get(dest.name) or {}) if dest.is_file() else {}
-        if skip_existing and dest.is_file() and rec.get("source") != "stock" \
-                and rec.get("prompt_hash") == s["hash"]:
-            fa.log(f"[{i:02d}] SKIP - {dest.name} already exists (same prompt)")
+        i = s["n"]
+        need_main = not (skip_existing and _is_fresh(meta, target, s["asset"], s["hash"]))
+        extras = [e for e in s["extras"]
+                  if not (skip_existing and _is_fresh(meta, target, e["asset"], e["hash"]))]
+        if not need_main and not extras:
+            fa.log(f"[{i:02d}] SKIP - {s['asset']} already exists (same prompt)")
             continue
-        if skip_existing and dest.is_file() and rec.get("source") == "stock":
-            fa.log(f"[{i:02d}] QUEUED - {dest.name} is a stock fallback image "
-                   "(low relevance) - replacing with a real Flow generation")
-        out.append(s)
+        if not need_main:
+            fa.log(f"[{i:02d}] {s['asset']} is current - queuing only its "
+                   f"{len(extras)} extra still(s)")
+        out.append(dict(s, need_main=need_main, extras=extras))
     return out
 
 
 def todo_records(scenes):
-    """scenes_todo.json rows: what the import must map, and to which file."""
-    return [{"n": s["n"], "hash": s["hash"], "mode": s.get("mode", "blender"),
-             "asset": s.get("asset") or "scene_%02d.jpg" % s["n"]} for s in scenes]
+    """scenes_todo.json rows: what the import must map, and to which file -
+    in batch order (a scene's own asset, then its extra stills)."""
+    rows = []
+    for s in scenes:
+        if s.get("need_main", True):
+            rows.append({"n": s["n"], "hash": s["hash"], "mode": s.get("mode", "blender"),
+                         "asset": s.get("asset") or "scene_%02d.jpg" % s["n"]})
+        for e in s.get("extras") or []:
+            rows.append({"n": s["n"], "hash": e["hash"], "mode": "blender",
+                         "asset": e["asset"], "extra": e["suffix"]})
+    return rows
 
 
 VIDEO_BATCH_NOTE = (
@@ -155,17 +207,22 @@ _OLD_VIDEO_NOTES = (
 
 
 def _batch_text(scenes):
-    """The exact text agent_batch_generate would send - one Agent submission
-    covering every scene, ready for a human to paste into Flow."""
+    """The exact text to paste into Flow - one Agent submission covering
+    every scene; a [VIDEO] scene is followed by its extra stills
+    ("Scene 1b (STILL, same scene as 1)")."""
     text = fa.AGENT_BATCH_PREAMBLE + "\n\n"
     if any(s.get("mode") == "video" for s in scenes):
         text += VIDEO_BATCH_NOTE + "\n\n"
     for s in scenes:
-        label = f"Scene {s['n']} (VIDEO CLIP)" if s.get("mode") == "video" else f"Scene {s['n']}"
-        text += f"{label}: {s['prompt']}\n"
-        if s.get("narration"):
-            text += f"NARRATION: {s['narration']}\n"
-        text += "\n"
+        if s.get("need_main", True):
+            label = f"Scene {s['n']} (VIDEO CLIP)" if s.get("mode") == "video" else f"Scene {s['n']}"
+            text += f"{label}: {s['prompt']}\n"
+            if s.get("narration"):
+                text += f"NARRATION: {s['narration']}\n"
+            text += "\n"
+        for e in s.get("extras") or []:
+            text += (f"Scene {s['n']}{e['suffix']} (STILL, same scene as {s['n']}): "
+                     f"{e['prompt']}\n\n")
     return text
 
 
@@ -313,7 +370,7 @@ def _import_from_folder(prompts, target, folder):
              and f.suffix.lower() in IMAGE_EXTS + VIDEO_EXTS]
     todo = _todo_for(prompts, target)
     fa.log(f"folder import: {len(files)} file(s) found in {folder} "
-           f"({len(todo)} scene(s) expected: "
+           f"({len(todo)} file(s) expected: "
            f"{sum(t['mode'] == 'video' for t in todo)} video clip(s))")
     if len(files) < len(todo):
         fa.log(f"IMPORT INCOMPLETE: {len(todo) - len(files)} file(s) short - "
@@ -332,14 +389,14 @@ def _import_from_folder(prompts, target, folder):
             return False
     target_path = Path(target)
     meta = _load_meta(target_path)
-    saved = [t["n"] for t, f in zip(todo, files)
+    saved = [t["asset"] for t, f in zip(todo, files)
              if _save_asset(target_path, meta, t, f.read_bytes(), "flow-folder")]
     _save_meta(target_path, meta)
-    missing = [t["n"] for t in todo if t["n"] not in saved]
+    missing = [t["asset"] for t in todo if t["asset"] not in saved]
     if missing:
-        fa.log(f"VALIDATION: scene(s) missing after folder import: {missing}")
+        fa.log(f"VALIDATION: file(s) missing after folder import: {missing}")
         return False
-    fa.log(f"VALIDATION PASSED: {len(saved)} scene(s) imported from folder")
+    fa.log(f"VALIDATION PASSED: {len(saved)} file(s) imported from folder")
     return True
 
 
@@ -409,10 +466,10 @@ def import_batch(prompts, target, project_url=None, from_folder=None):
             if not _save_asset(target_path, meta, t, data, "flow-project"):
                 fa.log(f"[{t['n']:02d}]   (source {str(src)[:70]})")
         _save_meta(target_path, meta)
-        missing = [t["n"] for t in todo
+        missing = [t["asset"] for t in todo
                    if (meta.get(t["asset"]) or {}).get("prompt_hash") != t["hash"]]
         if missing:
-            fa.log(f"VALIDATION: scene(s) still missing after import: {missing}")
+            fa.log(f"VALIDATION: file(s) still missing after import: {missing}")
             return False
         fa.log(f"VALIDATION PASSED: {len(todo)} scene(s) imported with provenance")
         return True
@@ -710,6 +767,9 @@ def split_block(block):
 _SCENE_LABEL = re.compile(r"^\s*Scene\s+\d+\s*(\(\s*VIDEO[^)]*\))?\s*:\s*", re.I)
 
 
+_EXTRA_LABEL = re.compile(r"^\s*Scene\s+\d+[a-z]\b", re.I)
+
+
 def _unlabel(block):
     """Strip a "Scene N:" label; "Scene N (VIDEO CLIP):" becomes a [VIDEO] tag."""
     m = _SCENE_LABEL.match(block)
@@ -735,7 +795,9 @@ def unbatch_text(text):
                                            + VIDEO_BATCH_NOTE) if p.strip()}
     preamble |= {norm(p) for p in _OLD_VIDEO_NOTES}
     blocks = [b for b in re.split(r"\n\s*\n", text) if b.strip()]
-    kept = [b for b in blocks if norm(b) not in preamble]
+    # extra stills ("Scene 1b (STILL, same scene as 1): ...") are generated
+    # from their [VIDEO] scene - they are not scenes of the script
+    kept = [b for b in blocks if norm(b) not in preamble and not _EXTRA_LABEL.match(b)]
     if len(kept) == len(blocks) and not any(_SCENE_LABEL.match(b) for b in blocks):
         return text                                   # an ordinary script
     return "\n\n".join(_unlabel(b) for b in kept) + "\n"
