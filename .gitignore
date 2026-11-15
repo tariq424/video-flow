@@ -22,3 +22,8 @@ remotion/.remotion/
 *.log
 flow_prompts*
 prompts.json
+
+# --- [3D_ORBIT] local install (rebuild: see README "3D orbit setup") ---
+.venv3d/
+Hunyuan3D-2/
+meshes/
