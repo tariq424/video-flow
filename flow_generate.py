@@ -420,7 +420,11 @@ def run_batch_agent(prompts, target, ctx=None, page=None):
 
 
 def run_batch(prompts, target, skip_existing=False):
-    saved, failed = [], []
+    # saved   = real Flow generations (or kept same-prompt Flow stills)
+    # stocked = beats covered by a STOCK web image because Flow failed -
+    #           reported separately and never counted as success
+    saved, failed, stocked = [], [], []
+    halted = None      # set when Google flags the automation: stop, don't retry
     meta = _load_meta(target)
     violated = _load_violated(target)
     total = len(prompts)
@@ -529,6 +533,12 @@ def run_batch(prompts, target, skip_existing=False):
                 saved.append(i)
                 last_exc = None
                 break
+            except fa.AutomationFlagged as e:
+                # Google flagged the SESSION - not a prompt problem: record
+                # nothing against the prompt and stop sending altogether
+                last_exc = e
+                halted = str(e)
+                break
             except Exception as e:                   # keep the batch going
                 last_exc = e
                 msg = str(e)
@@ -552,6 +562,14 @@ def run_batch(prompts, target, skip_existing=False):
                     time.sleep(5)
                     continue
                 break
+        if halted:
+            fa.log(f"[{i:02d}] STOPPED - {halted}")
+            fa.log("Not sending any more prompts this run. Generate the remaining "
+                   "scenes by hand (Prepare batch text -> paste into Flow -> Import).")
+            failed.append((i, "Google flagged the automated session - batch stopped"))
+            for j in range(i + 1, total + 1):
+                failed.append((j, "not attempted - batch stopped after Google's flag"))
+            break
         if last_exc is not None:
             why = (str(last_exc) if isinstance(last_exc, Blocker)
                    else f"{type(last_exc).__name__}: {str(last_exc)[:200]}")
@@ -578,9 +596,9 @@ def run_batch(prompts, target, skip_existing=False):
                                    "source": "stock",
                                    "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
                 _save_meta(target, meta)
-                fa.log(f"[{i:02d}] SAVED (stock FALLBACK, low relevance) -> {dest}")
-                saved.append(i)
-                last_exc = None
+                fa.log(f"[{i:02d}] STOCK STAND-IN (not a Flow image) -> {dest}")
+                stocked.append(i)
+            failed.append((i, why + (" -> stock stand-in used" if stock_ok else "")))
 
         # pacing cooldown after every GENERATED item: randomized rest between
         # browser sessions - back-to-back regular sessions are what tripped
@@ -590,20 +608,23 @@ def run_batch(prompts, target, skip_existing=False):
             rest = random.uniform(45, 120)
             fa.log(f"[{i:02d}] pacing cooldown {rest:.0f}s before the next generation ...")
             time.sleep(rest)
-        if last_exc is not None and "unusual activity" in str(last_exc).lower():
-            fa.log(f"[{i:02d}] unusual-activity flag - backing off 10 minutes before "
-                   f"the next item (the flag usually clears on its own) ...")
-            time.sleep(600)
 
     fa.log("")
-    fa.log(f"=== Flow batch summary: {len(saved)} saved, {len(failed)} failed/skipped ===")
+    fa.log(f"=== Flow batch summary: {len(saved)} Flow image(s), "
+           f"{len(stocked)} STOCK stand-in(s), "
+           f"{len(failed) - len(stocked)} failed/skipped ===")
     for i, why in failed:
         fa.log(f"  scene {i:02d}: {why}")
-    if saved:
-        fa.log("build_video.py prefers scene_NN files, so a plain Build will use them.")
-    # chain-friendly: the batch succeeded as long as SOMETHING was saved
-    # (single-item Flow hiccups must not abort a one-click pipeline that
-    # can still build from the remaining assets).
+    if halted:
+        fa.log(f"  STOPPED: {halted}")
+    if stocked:
+        fa.log(f"  stock stand-ins are generic web images, not your prompts - "
+               f"they are replaced on the next run: scenes {stocked}")
+    # chain-friendly: a pipeline may continue when at least one REAL Flow
+    # image exists; a run that produced only stock stand-ins (or nothing)
+    # is a failure and stops the chain.
+    if halted:
+        return False
     return bool(saved) or not failed
 
 
@@ -620,13 +641,35 @@ def split_block(block):
     return visual, narration
 
 
+_SCENE_LABEL = re.compile(r"^\s*Scene\s+\d+\s*:\s*", re.I)
+
+
+def unbatch_text(text):
+    """If `text` is a Flow batch (the AGENT_BATCH_PREAMBLE instructions
+    followed by "Scene N: <prompt>" blocks - what Copy puts on the clipboard),
+    return it as a normal script: the instructions dropped and the "Scene N:"
+    labels stripped. Anything else is returned unchanged.
+
+    The batch text easily gets pasted back into the script box; read as a
+    script, its instruction paragraphs became scenes 1 and 2."""
+    norm = lambda s: " ".join(s.split()).lower()
+    preamble = {norm(p) for p in re.split(r"\n\s*\n", fa.AGENT_BATCH_PREAMBLE) if p.strip()}
+    blocks = [b for b in re.split(r"\n\s*\n", text) if b.strip()]
+    kept = [b for b in blocks if norm(b) not in preamble]
+    if len(kept) == len(blocks) and not any(_SCENE_LABEL.match(b) for b in blocks):
+        return text                                   # an ordinary script
+    return "\n\n".join(_SCENE_LABEL.sub("", b, count=1).strip() for b in kept) + "\n"
+
+
 def parse_prompts_text(text):
     """Plain-paragraph prompts -> image-only items (free-tier friendly: stills
     are approved only at 0 credits). Paragraphs are blank-line separated; a
     single block with several lines falls back to one prompt per line.
     Item N becomes scene_NN.jpg. A trailing "NARRATION: <text>" per block is
-    carried in the item's "narration" key (kept out of the visual prompt)."""
-    blocks = [b.strip() for b in re.split(r"\n\s*\n", text) if b.strip()]
+    carried in the item's "narration" key (kept out of the visual prompt).
+    A pasted-back Flow batch is converted first (see unbatch_text)."""
+    text = unbatch_text(text)
+    blocks =[b.strip() for b in re.split(r"\n\s*\n", text) if b.strip()]
     if len(blocks) <= 1:
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         if len(lines) > 1:
