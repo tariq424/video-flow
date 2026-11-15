@@ -26,6 +26,7 @@ import json
 import random
 import shutil
 import hashlib
+import subprocess
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -91,12 +92,11 @@ def _save_violated(target, data):
         pass
 
 
-def _manual_scenes(prompts, target, skip_existing=True):
-    """The scenes the manual batch must generate: sanitized exactly like
-    run_batch (same header-line / narration-only / sanitize order), optionally
-    limited to scenes whose still is missing or made from a different prompt.
-    Returns [{"n", "prompt", "narration", "hash"}, ...]."""
-    meta = _load_meta(target)
+def scene_plan(prompts):
+    """The ONE scene list shared by the batch text, the import, the manifest
+    and the build: [{"n", "prompt" (sanitized - what Flow is sent), "hash",
+    "narration", "mode", "asset"}]. mode "video" scenes get a Flow video clip
+    (asset scene_NN.mp4); every other scene gets a still (scene_NN.jpg)."""
     out = []
     for i, it in enumerate(prompts, 1):
         desc = str(it.get("prompt", "")).strip()
@@ -108,26 +108,54 @@ def _manual_scenes(prompts, target, skip_existing=True):
         if not desc:
             continue
         desc = fa.sanitize_prompt(desc)
-        ph = _prompt_hash(desc)
-        dest = Path(target) / f"scene_{i:02d}.jpg"
+        mode = str(it.get("mode") or "blender").lower()
+        out.append({"n": i, "prompt": desc, "hash": _prompt_hash(desc),
+                    "narration": narr, "mode": mode,
+                    "asset": f"scene_{i:02d}.{'mp4' if mode == 'video' else 'jpg'}"})
+    return out
+
+
+def _manual_scenes(prompts, target, skip_existing=True):
+    """The scenes the manual batch must generate (scene_plan), optionally
+    limited to scenes whose still/clip is missing, a stock stand-in, or made
+    from a different prompt."""
+    meta = _load_meta(target)
+    out = []
+    for s in scene_plan(prompts):
+        i, dest = s["n"], Path(target) / s["asset"]
         rec = (meta.get(dest.name) or {}) if dest.is_file() else {}
         if skip_existing and dest.is_file() and rec.get("source") != "stock" \
-                and rec.get("prompt_hash") == ph:
+                and rec.get("prompt_hash") == s["hash"]:
             fa.log(f"[{i:02d}] SKIP - {dest.name} already exists (same prompt)")
             continue
         if skip_existing and dest.is_file() and rec.get("source") == "stock":
             fa.log(f"[{i:02d}] QUEUED - {dest.name} is a stock fallback image "
                    "(low relevance) - replacing with a real Flow generation")
-        out.append({"n": i, "prompt": desc, "narration": narr, "hash": ph})
+        out.append(s)
     return out
+
+
+def todo_records(scenes):
+    """scenes_todo.json rows: what the import must map, and to which file."""
+    return [{"n": s["n"], "hash": s["hash"], "mode": s.get("mode", "blender"),
+             "asset": s.get("asset") or "scene_%02d.jpg" % s["n"]} for s in scenes]
+
+
+VIDEO_BATCH_NOTE = (
+    "Exception - scenes labelled (VIDEO CLIP): for each of those, generate ONE "
+    "short video clip instead of an image (cinematic, 16:9, slow camera "
+    "movement, no text). Every other scene is a still image as described above.")
 
 
 def _batch_text(scenes):
     """The exact text agent_batch_generate would send - one Agent submission
     covering every scene, ready for a human to paste into Flow."""
     text = fa.AGENT_BATCH_PREAMBLE + "\n\n"
+    if any(s.get("mode") == "video" for s in scenes):
+        text += VIDEO_BATCH_NOTE + "\n\n"
     for s in scenes:
-        text += f"Scene {s['n']}: {s['prompt']}\n"
+        label = f"Scene {s['n']} (VIDEO CLIP)" if s.get("mode") == "video" else f"Scene {s['n']}"
+        text += f"{label}: {s['prompt']}\n"
         if s.get("narration"):
             text += f"NARRATION: {s['narration']}\n"
         text += "\n"
@@ -164,7 +192,7 @@ def prepare_batch(prompts, target):
     out.mkdir(parents=True, exist_ok=True)
     (out / "agent_batch.txt").write_text(_batch_text(scenes), encoding="utf-8")
     (out / "scenes_todo.json").write_text(
-        json.dumps([{"n": s["n"], "hash": s["hash"]} for s in scenes], indent=1),
+        json.dumps(todo_records(scenes), indent=1),
         encoding="utf-8")
     _copy_to_clipboard(_batch_text(scenes))
     fa.log(f"manual batch ready: {len(scenes)} scene(s) -> {out / 'agent_batch.txt'} "
@@ -215,52 +243,92 @@ def open_project_session(target):
     return True
 
 
-def _import_from_folder(prompts, target, folder):
-    """Folder import: images sorted by filename map to scene_01..NN with
-    provenance. Order = filename order - the user controls it by naming."""
-    d = Path(folder)
-    if not d.is_dir():
-        fa.log(f"folder not found: {folder}")
-        return False
-    files = [f for f in sorted(d.iterdir())
-             if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")
-             and f.is_file()]
-    if not files:
-        fa.log(f"no images in {folder}")
-        return False
+IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp")
+VIDEO_EXTS = (".mp4", ".mov", ".webm")
+
+
+def _todo_for(prompts, target):
+    """The scenes an import must map: scenes_todo.json from the last Prepare,
+    else the whole script. Older todo files have no mode/asset - default them."""
     todo_path = Path(target) / "scenes_todo.json"
     if todo_path.is_file():
         todo = json.loads(todo_path.read_text(encoding="utf-8"))
     else:
-        todo = [{"n": i, "hash": _prompt_hash(fa.sanitize_prompt(str(it.get("prompt", "")).strip()))}
-                for i, it in enumerate(prompts, 1)]
-    n_expected = len(todo)
-    fa.log(f"folder import: {len(files)} image(s) found in {folder} "
-           f"({n_expected} scene(s) expected)")
-    if len(files) < n_expected:
-        fa.log(f"IMPORT INCOMPLETE: {n_expected - len(files)} image(s) short - "
+        todo = todo_records(scene_plan(prompts))
+    for t in todo:
+        t.setdefault("mode", "blender")
+        t.setdefault("asset", "scene_%02d.jpg" % t["n"])
+    return todo
+
+
+def _last_frame(mp4, jpg):
+    """Last frame of a clip as a still (the build continues the shot from it
+    when the clip is shorter than its narration slot)."""
+    r = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-sseof", "-0.2",
+                        "-i", str(mp4), "-frames:v", "1", "-q:v", "2", str(jpg)],
+                       capture_output=True, text=True)
+    return r.returncode == 0 and Path(jpg).is_file()
+
+
+def _save_asset(target_path, meta, t, data, source):
+    """Write one imported file to its scene; returns True when valid."""
+    n, video = t["n"], t["mode"] == "video"
+    ok = fa.is_video(data) if video else fa.is_image(data)
+    if not data or not ok:
+        fa.log(f"[{n:02d}] FAILED - not a valid {'video' if video else 'image'}")
+        return False
+    dest = target_path / t["asset"]
+    dest.write_bytes(data)
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    meta[dest.name] = {"prompt_hash": t["hash"], "source": source, "ts": stamp}
+    msg = f"[{n:02d}] SAVED -> {dest.name} ({len(data) // 1024} KB)"
+    if video:
+        still = target_path / f"scene_{n:02d}.jpg"
+        if _last_frame(dest, still):
+            meta[still.name] = {"prompt_hash": t["hash"], "source": "video-frame", "ts": stamp}
+            msg += f" + last frame -> {still.name}"
+        else:
+            fa.log(f"[{n:02d}] could not extract the clip's last frame (ffmpeg)")
+    fa.log(msg)
+    return True
+
+
+def _import_from_folder(prompts, target, folder):
+    """Folder import: files sorted by name map to the to-do scenes in order
+    (01.jpg, 02.jpg, 03.mp4 ...). Images go to still scenes, .mp4 clips to
+    [VIDEO] scenes - a file of the wrong kind for its slot stops the import
+    (order would be off). Decouples the import from browser accounts."""
+    d = Path(folder)
+    if not d.is_dir():
+        fa.log(f"folder not found: {folder}")
+        return False
+    files = [f for f in sorted(d.iterdir()) if f.is_file()
+             and f.suffix.lower() in IMAGE_EXTS + VIDEO_EXTS]
+    todo = _todo_for(prompts, target)
+    fa.log(f"folder import: {len(files)} file(s) found in {folder} "
+           f"({len(todo)} scene(s) expected: "
+           f"{sum(t['mode'] == 'video' for t in todo)} video clip(s))")
+    if len(files) < len(todo):
+        fa.log(f"IMPORT INCOMPLETE: {len(todo) - len(files)} file(s) short - "
                f"nothing mapped. Name the files so sort order = scene order.")
         return False
-    if len(files) > n_expected:
-        fa.log(f"mapping the FIRST {n_expected} in filename order")
-        files = files[:n_expected]
+    if len(files) > len(todo):
+        fa.log(f"mapping the FIRST {len(todo)} in filename order")
+        files = files[:len(todo)]
+    for t, f in zip(todo, files):
+        want_video = t["mode"] == "video"
+        if (f.suffix.lower() in VIDEO_EXTS) != want_video:
+            fa.log(f"IMPORT STOPPED: scene {t['n']:02d} needs "
+                   f"{'a video clip (.mp4)' if want_video else 'an image'} but the "
+                   f"file in its position is {f.name}. Nothing was mapped - "
+                   f"rename the files so sort order = scene order.")
+            return False
     target_path = Path(target)
     meta = _load_meta(target_path)
-    saved = []
-    for s, src in zip(todo, files):
-        n, ph = s["n"], s["hash"]
-        data = src.read_bytes()
-        if not data or not fa.is_image(data):
-            fa.log(f"[{n:02d}] FAILED - {src.name} is not a valid image")
-            continue
-        dest = target_path / f"scene_{n:02d}.jpg"
-        dest.write_bytes(data)
-        meta[dest.name] = {"prompt_hash": ph, "source": "flow-folder",
-                           "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
-        fa.log(f"[{n:02d}] SAVED <- {src.name} ({len(data) // 1024} KB)")
-        saved.append(n)
+    saved = [t["n"] for t, f in zip(todo, files)
+             if _save_asset(target_path, meta, t, f.read_bytes(), "flow-folder")]
     _save_meta(target_path, meta)
-    missing = [s["n"] for s in todo if s["n"] not in saved]
+    missing = [t["n"] for t in todo if t["n"] not in saved]
     if missing:
         fa.log(f"VALIDATION: scene(s) missing after folder import: {missing}")
         return False
@@ -269,31 +337,25 @@ def _import_from_folder(prompts, target, folder):
 
 
 def import_batch(prompts, target, project_url=None, from_folder=None):
-    """Manual-assist step 3: map generated images to scene_NN.jpg.
+    """Manual-assist step 3: map generated images/clips to their scenes.
 
-    from_folder: a LOCAL directory of downloaded images (named so their sort
-    order = scene order, e.g. 01.jpg..09.jpg) - completely decouples the
-    import from browser accounts; the user can download from any account and
-    drop the files in a folder.
-    project_url: the Flow project URL to read via the automation browser
-    (same Google account as the profile). Order = DOM order, which Flow does
-    NOT guarantee to be submission order - the folder path is safer when
-    order matters. On a count mismatch nothing is mapped (order would be
-    guesswork) - generate the rest and re-import."""
+    from_folder: a LOCAL directory of downloaded files named so their sort
+    order = scene order - works with any Google account.
+    project_url: the Flow project to read via the automation browser (same
+    Google account as the profile). Images map to still scenes and videos to
+    [VIDEO] scenes, each in page order, which Flow does NOT guarantee to be
+    submission order - the folder path is safer when order matters. On a
+    count shortfall nothing is mapped (order would be guesswork)."""
     if from_folder:
         return _import_from_folder(prompts, target, from_folder)
     base_path = Path(target) / "import_baseline.json"
     base = json.loads(base_path.read_text(encoding="utf-8")) if base_path.is_file() else {}
-    todo_path = Path(target) / "scenes_todo.json"
-    if todo_path.is_file():
-        todo = json.loads(todo_path.read_text(encoding="utf-8"))
-    else:
-        # no prepare step ran - build the todo from the script itself
-        todo = [{"n": i, "hash": _prompt_hash(fa.sanitize_prompt(str(it.get("prompt", "")).strip()))}
-                for i, it in enumerate(prompts, 1)]
+    todo = _todo_for(prompts, target)
     if not todo:
         fa.log("no scenes to import - prepare the batch first")
         return False
+    img_todo = [t for t in todo if t["mode"] != "video"]
+    vid_todo = [t for t in todo if t["mode"] == "video"]
     url = project_url or base.get("url") or fa.PROJECT_URL or fa.FLOW_HOME
     if not fa.cdp_alive():
         fa.log("no manual-assist browser running - launching one (same profile, "
@@ -306,49 +368,46 @@ def import_batch(prompts, target, project_url=None, from_folder=None):
             return False
         same_base = base.get("url") == url and base.get("srcs")
         before = set(base.get("srcs") or []) if same_base else set()
-        if same_base:
-            new_srcs = [s for s in fa.frames_imgs(page) if s not in before]
-        else:
-            new_srcs = list(fa.frames_imgs(page))
-            fa.log("no matching baseline for this URL - treating ALL images in "
+        if not same_base:
+            fa.log("no matching baseline for this URL - treating ALL media in "
                    "the project as the batch (use a brand-new project!)")
-        fa.log(f"import: {len(new_srcs)} image(s) found "
-               f"({len(todo)} expected)")
-        if len(new_srcs) < len(todo):
-            fa.log(f"IMPORT INCOMPLETE: {len(todo) - len(new_srcs)} scene image(s) "
-                   f"still missing - let Flow finish (or regenerate the missing "
-                   f"ones) and click 'Import Flow stills' again. Nothing was mapped.")
+        imgs = [s for s in fa.frames_imgs(page) if s not in before]
+        vids = []
+        for s in fa.frames_videos(page):          # de-duplicate, keep order
+            if s not in before and s not in vids:
+                vids.append(s)
+        fa.log(f"import: {len(imgs)} image(s) for {len(img_todo)} still scene(s), "
+               f"{len(vids)} video(s) for {len(vid_todo)} [VIDEO] scene(s)")
+        short = []
+        if len(imgs) < len(img_todo):
+            short.append(f"{len(img_todo) - len(imgs)} image(s)")
+        if len(vids) < len(vid_todo):
+            short.append(f"{len(vid_todo) - len(vids)} video clip(s)")
+        if short:
+            fa.log(f"IMPORT INCOMPLETE: {' and '.join(short)} still missing - let "
+                   f"Flow finish (or generate the missing ones) and import again. "
+                   f"Nothing was mapped.")
             return False
-        if len(new_srcs) > len(todo):
-            fa.log("more images than expected - mapping the FIRST "
-                   f"{len(todo)} in DOM order (chronological = scene order; "
-                   "extra images stay in Flow)")
-            new_srcs = new_srcs[:len(todo)]
+        if len(imgs) > len(img_todo) or len(vids) > len(vid_todo):
+            fa.log("more media than expected - mapping the FIRST ones in page "
+                   "order (extra items stay in Flow)")
+        pairs = list(zip(img_todo, imgs)) + list(zip(vid_todo, vids))
 
         target_path = Path(target)
         target_path.mkdir(parents=True, exist_ok=True)
         meta = _load_meta(target_path)
-        for s, src in zip(todo, new_srcs):
-            n, ph = s["n"], s["hash"]
-            data = fa._download(src, ctx, page, "image")
-            if not data or not fa.is_image(data):
-                fa.log(f"[{n:02d}] FAILED - download failed or not a valid image "
-                       f"({str(src)[:70]})")
-                continue
-            dest = target_path / f"scene_{n:02d}.jpg"
-            dest.write_bytes(data)
-            meta[dest.name] = {"prompt_hash": ph,
-                               "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
-            fa.log(f"[{n:02d}] SAVED -> {dest} ({len(data) // 1024} KB)")
+        for t, src in sorted(pairs, key=lambda p: p[0]["n"]):
+            kind = "video" if t["mode"] == "video" else "image"
+            data = fa._download(src, ctx, page, kind)
+            if not _save_asset(target_path, meta, t, data, "flow-project"):
+                fa.log(f"[{t['n']:02d}]   (source {str(src)[:70]})")
         _save_meta(target_path, meta)
-        saved, missing = [], []
-        for s in todo:
-            rec = meta.get(f"scene_{s['n']:02d}.jpg") or {}
-            (saved if rec.get("prompt_hash") == s["hash"] else missing).append(s["n"])
+        missing = [t["n"] for t in todo
+                   if (meta.get(t["asset"]) or {}).get("prompt_hash") != t["hash"]]
         if missing:
             fa.log(f"VALIDATION: scene(s) still missing after import: {missing}")
             return False
-        fa.log(f"VALIDATION PASSED: {len(saved)} scene(s) imported with provenance")
+        fa.log(f"VALIDATION PASSED: {len(todo)} scene(s) imported with provenance")
         return True
     finally:
         # keep the window open - the user may need to re-import
@@ -641,7 +700,19 @@ def split_block(block):
     return visual, narration
 
 
-_SCENE_LABEL = re.compile(r"^\s*Scene\s+\d+\s*:\s*", re.I)
+_SCENE_LABEL = re.compile(r"^\s*Scene\s+\d+\s*(\(\s*VIDEO[^)]*\))?\s*:\s*", re.I)
+
+
+def _unlabel(block):
+    """Strip a "Scene N:" label; "Scene N (VIDEO CLIP):" becomes a [VIDEO] tag."""
+    m = _SCENE_LABEL.match(block)
+    if not m:
+        return block.strip()
+    rest = block[m.end():].strip()
+    if not m.group(1):
+        return rest
+    first, _, tail = rest.partition("\n")
+    return (first.rstrip() + " [VIDEO]" + ("\n" + tail if tail else "")).strip()
 
 
 def unbatch_text(text):
@@ -653,12 +724,13 @@ def unbatch_text(text):
     The batch text easily gets pasted back into the script box; read as a
     script, its instruction paragraphs became scenes 1 and 2."""
     norm = lambda s: " ".join(s.split()).lower()
-    preamble = {norm(p) for p in re.split(r"\n\s*\n", fa.AGENT_BATCH_PREAMBLE) if p.strip()}
+    preamble = {norm(p) for p in re.split(r"\n\s*\n", fa.AGENT_BATCH_PREAMBLE + "\n\n"
+                                           + VIDEO_BATCH_NOTE) if p.strip()}
     blocks = [b for b in re.split(r"\n\s*\n", text) if b.strip()]
     kept = [b for b in blocks if norm(b) not in preamble]
     if len(kept) == len(blocks) and not any(_SCENE_LABEL.match(b) for b in blocks):
         return text                                   # an ordinary script
-    return "\n\n".join(_SCENE_LABEL.sub("", b, count=1).strip() for b in kept) + "\n"
+    return "\n\n".join(_unlabel(b) for b in kept) + "\n"
 
 
 def parse_prompts_text(text):
