@@ -245,7 +245,9 @@ for k, sc in enumerate(cfg["scenes"], 1):
 
     scene.frame_start = f0
     scene.frame_end = f1
-    frames_dir = os.path.join(OUT, "frames_%02d" % k)
+    # named by the shot's TIMELINE number (sc["n"]), which is what the encoder
+    # looks for - not k, which skips spliced clips / orbits
+    frames_dir = os.path.join(OUT, "frames_%02d" % sc["n"])
     os.makedirs(frames_dir, exist_ok=True)
     scene.render.filepath = os.path.join(frames_dir, "frame_")
     print("BLENDER_SCENE_START %d (%s)" % (k, shot), flush=True)
@@ -258,6 +260,16 @@ for k, sc in enumerate(cfg["scenes"], 1):
 json.dump({"ok": True}, open(os.path.join(OUT, "blender_done.json"), "w"))
 print("BLENDER_ALL_DONE", flush=True)
 '''
+
+
+def _probe_duration(path):
+    """Seconds of a media file (0.0 when ffprobe can't read it)."""
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                        "-of", "default=nw=1:nk=1", path], capture_output=True, text=True)
+    try:
+        return float(r.stdout.strip())
+    except ValueError:
+        return 0.0
 
 
 def find_blender():
@@ -338,25 +350,44 @@ def render_blender_storyboard(scenes, timeline_out, width=1920, height=1080, fps
                 print(f"scene {i:02d}: 3D ORBIT FAILED ({str(e)[:160]}) - "
                       f"falling back to the 2.5D shot list", flush=True)
 
+        continue_from_clip = False
         if mode == "video":
             vp = s.get("video")
             if vp and os.path.isfile(vp):
                 part = os.path.join(out_dir, f"motion_scene_{i:02d}.mp4")
+                clip_frames = int(_probe_duration(vp) * fps)
+                rem = frames - clip_frames
+                # a clip at most 2s short: hold its last frame to fill the slot;
+                # much shorter: play it whole, then continue with camera shots
+                # over its last frame (scene_NN.jpg); longer: trim
+                hold = rem > 0 and rem <= 2 * fps
+                use = frames if (hold or rem <= 0) else clip_frames
+                vf = (f"scale={width}:{height}:force_original_aspect_ratio="
+                      f"decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps={fps}")
+                if hold:
+                    vf += f",tpad=stop_mode=clone:stop={rem + fps}"
                 r = subprocess.run(
-                    ["ffmpeg", "-y", "-loglevel", "error", "-i", vp,
-                     "-vf", f"scale={width}:{height}:force_original_aspect_ratio="
-                            f"decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
-                            f"fps={fps}",
-                     "-frames:v", str(frames),
+                    ["ffmpeg", "-y", "-loglevel", "error", "-i", vp, "-vf", vf,
+                     "-frames:v", str(use), "-an",       # narration is the only audio
                      "-c:v", "libx264", "-preset", "slow", "-crf", "17",
                      "-pix_fmt", "yuv420p", part],
                     capture_output=True, text=True)
-                if r.returncode == 0 and os.path.isfile(part):
-                    print(f"scene {i:02d}: [VIDEO] spliced {os.path.basename(vp)}")
+                if r.returncode == 0 and os.path.isfile(part) and clip_frames > 0:
                     plan.append(("file", part))
-                    continue
-                print(f"scene {i:02d}: video splice failed ({r.stderr[:120]}) "
-                      "- falling back to the 2.5D shot list")
+                    if use >= frames:
+                        how = (f"last frame held {rem / fps:.1f}s" if hold
+                               else "trimmed to its slot" if rem < 0 else "exact fit")
+                        print(f"scene {i:02d}: [VIDEO] spliced {os.path.basename(vp)} "
+                              f"({clip_frames / fps:.1f}s clip, {how})")
+                        continue
+                    print(f"scene {i:02d}: [VIDEO] spliced {os.path.basename(vp)} "
+                          f"({clip_frames / fps:.1f}s), then {rem / fps:.1f}s of camera "
+                          f"shots over its last frame")
+                    frames = rem
+                    continue_from_clip = True
+                else:
+                    print(f"scene {i:02d}: video splice failed ({r.stderr[:120]}) "
+                          "- falling back to the 2.5D shot list")
             else:
                 print(f"scene {i:02d}: [VIDEO] tag but no scene_{i:02d}.mp4 "
                       "found - falling back to the 2.5D shot list")
@@ -369,8 +400,11 @@ def render_blender_storyboard(scenes, timeline_out, width=1920, height=1080, fps
               f"{base / fps:.1f}s")
         for j in range(n_sub):
             f = base + (1 if j < extra else 0)
-            shot = SHOTS[shot_cursor % len(SHOTS)]
-            shot_cursor += 1
+            if continue_from_clip and j == 0:
+                shot = "establishing"     # starts on the full frame = the clip's end
+            else:
+                shot = SHOTS[shot_cursor % len(SHOTS)]
+                shot_cursor += 1
             plan.append(("shots", {"image": image, "frames": f,
                                    "shot": shot, "n": len(plan) + 1}))
 
