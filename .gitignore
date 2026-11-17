@@ -30,3 +30,7 @@ meshes/
 
 # --- isolated Blender profile for the Blender MCP (blender_mcp_launch.py) ---
 .blender_mcp_profile/
+
+# --- depth model for parallax (depth_layers.py downloads it) ---
+models/
+remotion/film_props_*.json

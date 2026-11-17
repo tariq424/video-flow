@@ -1,5 +1,6 @@
 import { Composition } from "remotion";
 import { Storyboard } from "./Storyboard";
+import { Film, filmFrames } from "./Film";
 
 export const totalFrames = (props) => {
   const { scenes = [] } = props;
@@ -11,6 +12,17 @@ export const totalFrames = (props) => {
 };
 
 export const RemotionRoot = () => (
+  <>
+  <Composition
+    id="Film"
+    component={Film}
+    durationInFrames={1}
+    fps={30}
+    width={1920}
+    height={1080}
+    defaultProps={{ items: [], overlays: [], total: 1 }}
+    calculateMetadata={({ props }) => ({ durationInFrames: filmFrames(props) })}
+  />
   <Composition
     id="Storyboard"
     component={Storyboard}
@@ -23,4 +35,5 @@ export const RemotionRoot = () => (
       durationInFrames: totalFrames(props),
     })}
   />
+  </>
 );
