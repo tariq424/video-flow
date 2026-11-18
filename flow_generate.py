@@ -400,6 +400,46 @@ def _import_from_folder(prompts, target, folder):
     return True
 
 
+def import_mapped(prompts, target, map_file):
+    """Zip import, after the user checked and approved the mapping in the GUI's
+    dialog. map_file is JSON {"files": [path or null, ...]} with one entry per
+    to-do row (scenes_todo.json order). Mapped files are saved with provenance;
+    a row left empty stays missing (reported, and the import counts as failed
+    so no build starts on an incomplete set - what was mapped is kept)."""
+    todo = _todo_for(prompts, target)
+    files = json.loads(Path(map_file).read_text(encoding="utf-8")).get("files") or []
+    if len(files) != len(todo):
+        fa.log(f"IMPORT STOPPED: the approved mapping has {len(files)} row(s) but "
+               f"{len(todo)} scene file(s) are expected - prepare the batch again.")
+        return False
+    target_path = Path(target)
+    meta = _load_meta(target_path)
+    saved, empty = [], []
+    for t, f in zip(todo, files):
+        if not f:
+            empty.append(t["asset"])
+            continue
+        f = Path(f)
+        if (f.suffix.lower() in VIDEO_EXTS) != (t["mode"] == "video"):
+            fa.log(f"[{t['n']:02d}] SKIPPED - {t['asset']} needs "
+                   f"{'a video clip' if t['mode'] == 'video' else 'an image'}, got {f.name}")
+            empty.append(t["asset"])
+            continue
+        if _save_asset(target_path, meta, t, f.read_bytes(), "flow-zip"):
+            saved.append(t["asset"])
+        else:
+            empty.append(t["asset"])
+    _save_meta(target_path, meta)
+    fa.log(f"zip import: {len(saved)} of {len(todo)} file(s) mapped")
+    if empty:
+        listed = ", ".join(empty[:12]) + (f" and {len(empty) - 12} more" if len(empty) > 12 else "")
+        fa.log(f"IMPORT INCOMPLETE: no picture yet for {listed} - generate "
+               f"those in Flow and import again (the mapped ones are kept).")
+        return False
+    fa.log(f"VALIDATION PASSED: {len(saved)} file(s) imported from the zip")
+    return True
+
+
 def import_batch(prompts, target, project_url=None, from_folder=None):
     """Manual-assist step 3: map generated images/clips to their scenes.
 
@@ -927,6 +967,9 @@ def main():
         sys.exit(0 if prepare_batch(prompts, target) else 1)
     if "--open-project" in argv:
         sys.exit(0 if open_project_session(target) else 1)
+    if "--import-batch" in argv and "--from-map" in argv:
+        k = argv.index("--from-map")
+        sys.exit(0 if k + 1 < len(argv) and import_mapped(prompts, target, argv[k + 1]) else 1)
     if "--import-batch" in argv:
         folder = None
         if "--from-folder" in argv:
