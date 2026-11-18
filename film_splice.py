@@ -95,7 +95,9 @@ def main():
     old_props = json.loads((fs.REMOTION / f"film_props_{old_tag}.json").read_text(encoding="utf8"))
     old_picture = md / "film_work" / old_tag / "picture.mp4"
     fs.log("dry run of the old spec (shot list only) ...")
+    fs.CLIP_CONTINUITY = bool(old_props.get("clip_continuity"))   # replay the old job exactly as it was built
     old_desc = _shots_of(old_spec)
+    fs.CLIP_CONTINUITY = True
     assert len(old_desc) == len(old_props["items"]), "old spec does not reproduce the old job's shots"
 
     new_desc = []

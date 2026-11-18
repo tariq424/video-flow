@@ -42,6 +42,7 @@ _SPLIT = r'(?<=[.!?…])(?<!\bDr\.)(?<!\bMr\.)(?<!\bMrs\.)(?<!\bSt\.)\s+(?=[A-Z"
 
 
 XF = 14   # dissolve length in frames (~0.47 s)
+CLIP_CONTINUITY = True   # film_splice turns this off to replay specs built before it existed
 
 
 def log(m):
@@ -224,6 +225,19 @@ def build(spec):
             at = pc["sent"][min(o.get("at_sent", 0), len(pc["sent"]) - 1)] + o.get("at", 0)
             overlays.append(dict(o, **{"from": round(at * FPS), "dur": round(o["dur"] * FPS)}))
 
+    # a clip split over two shots (V(x, 0, 5) then V(x, 5, 10)) must stay continuous through the
+    # dissolve: the first part plays on through its overlap and the second picks up at the matching
+    # clip time, so both layers show the same frames (no freeze, no double image)
+    for k in range(1, len(jobs) if CLIP_CONTINUITY else 0):
+        p0, p1 = jobs[k - 1][0], jobs[k][0]
+        if ("video" in p0 and p0.get("video") == p1.get("video") and not p0.get("reverse") and not p1.get("reverse")
+                and p0.get("end") is not None and abs(p1.get("start", 0) - p0["end"]) < 0.05):
+            off = (items[k]["from"] - items[k - 1]["from"]) / FPS
+            new_start = p0.get("start", 0) + off
+            if p1.get("end") is None or new_start < p1["end"] - 0.5:
+                jobs[k - 1] = (dict(p0, end=round(p0.get("start", 0) + jobs[k - 1][1], 3)),) + jobs[k - 1][1:]
+                jobs[k] = (dict(p1, start=round(new_start, 3)),) + jobs[k][1:]
+
     def render_one(job):
         s, seconds, out = job
         if "still" in s:
@@ -238,7 +252,8 @@ def build(spec):
 
     total_f = round(total * FPS)
     props = REMOTION / f"film_props_{tag}.json"
-    props.write_text(json.dumps({"items": items, "overlays": overlays, "total": total_f}, indent=1), encoding="utf8")
+    props.write_text(json.dumps({"items": items, "overlays": overlays, "total": total_f,
+                                      "clip_continuity": CLIP_CONTINUITY}, indent=1), encoding="utf8")
     picture = work / "picture.mp4"
     log(f"Remotion: {len(items)} shots, {total_f} frames ...")
     cmd = [_npx(), "remotion", "render", "src/index.jsx", "Film", str(picture), "--props", str(props),
