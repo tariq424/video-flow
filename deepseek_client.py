@@ -46,4 +46,5 @@ if __name__ == "__main__":
     args = [a for a in sys.argv[1:] if a != "--search"]
     if not args:
         sys.exit(__doc__)
+    sys.stdout.reconfigure(encoding="utf-8")   # replies carry characters the Windows console code page lacks
     print(ask(" ".join(args), search="--search" in sys.argv))
