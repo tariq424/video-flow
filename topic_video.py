@@ -119,12 +119,21 @@ Rules:
 - scenes: {n_scenes} scenes (allowed {n_min}-{n_max}). Each narration is {w_lo}-{w_hi} words; all narration together is
   about {words} words (that is the video's length). Spoken English, vivid, accurate, no headings or lists; one story
   from a strong opening hook to a satisfying end.
-- visual: ONE shot, 16:9, cinematic, photorealistic, 25-60 words: subject, setting, light, camera angle, mood. No
-  text, captions, logos or signs with writing. If the shot shows a reference, use its exact name and list it in "refs".
+- visual: ONE shot, 25-60 words. START with the named place or subject when there is one ("Vaduz Castle,
+  Liechtenstein, ..."), then the concrete things in frame, light, camera angle and mood; END with "16:9,
+  photorealistic". No text, captions, logos or signs with writing. If the shot shows a reference, use its exact name
+  and list it in "refs".
+- narration style (the owner's house style): write every number in words as it is spoken ("three point five per
+  million", "forty-five billionaires", "nineteen nineteen"), so the voice reads it naturally; open with a hook that
+  makes the viewer want the rest (a surprise, a flip of expectations); for a ranking count DOWN ("Number ten, ..." to
+  "And number one, ..."); name the main data source once in the narration ("using Forbes 2025 data"); end with a
+  clear takeaway ("The lesson is clear: ...").
 - stock: a short generic search that stock-footage sites (Pexels, Pixabay) would match for this shot, e.g. "harbor
   fog boats dawn", "old factory smokestacks". Empty when the shot needs a reference character.
 - photo: when the shot shows a REAL specific subject that photo archives hold (a named building, ship, event, city,
   historic photo), a search for it, e.g. "Boston North End 1919". Otherwise "".
+- Faceless ("headless") video: no host and no presenter. Never write "I", "welcome to my channel", "in this video",
+  a channel name or the owner's name; the narration speaks about the subject only.
 - Keep pictures safe for an image model: no gore, no weapons aimed at people, never children together with violence.
 - motion: 0-3, how much the moment needs real movement (3 = it only works as moving video). Most scenes are 0 or 1.
 - Facts must be correct. Use the research notes; do not invent statistics, dates or quotes."""
@@ -177,6 +186,152 @@ def plan(topic, minutes, target):
     raise SystemExit("plan failed: DeepSeek did not return a usable plan twice")
 
 
+# ------------------------------------------------------------------ hook, repeats, proofreading
+# Modelled on Video Studio's writer (its rules, our own code): the opening sentence must be a real HOOK, it must not say
+# what a later line says (it teases, never repeats), and the narration is proofread before the voice records it.
+HOOK_CHECK = """The first sentence of a video:
+"{first}"
+Video title: "{title}"
+Is that first sentence a HOOK - a surprising claim, a striking number, a sharp question or high stakes that makes a viewer
+need to keep watching? It is NOT a hook if it is a credit or attribution ("X says", "using X data" first), a recap, a
+greeting, an introduction of the host or channel, plain framing ("Today we look at ..."), or simply the first item of a
+list ("Number ten, ...").
+If it is not, write ONE hook sentence of 8-25 words to go BEFORE it, using only facts from the narration below (no number
+or claim that is not in it), numbers written in words as spoken, never naming the channel owner or any host.
+Narration (facts only):
+{body}
+Reply with JSON: {{"is_hook": true or false, "why": "a few words", "hook": "... or empty"}}"""
+
+FRESH_HOOK = """This is the first sentence of a video, its cold-open hook:
+"{hook}"
+It repeats this line that the narration says later:
+"{later}"
+Rewrite ONLY the hook: one sentence of 8-25 words that makes the viewer need to keep watching - the stakes, a sharp
+question or a surprising consequence - drawn from the video's subject ("{title}") but worded so it repeats NO later
+sentence. No recap, no "In this video", no host introduction, no number or claim that is not in the narration below.
+Numbers in words as spoken.
+Narration (facts only):
+{body}
+Reply with JSON: {{"hook": "..."}}"""
+
+PROOF = """Proofread this video narration before it is recorded. Find ONLY: misspellings, two words run together, a word split
+in two, doubled words ("the the"), wrong homophones (its/it's, their/there), and broken punctuation that would make a
+narrator read it wrongly. Do NOT reword, shorten, restyle or fact-check anything.
+For each problem give the exact wrong text as it appears (a few words, copied exactly) and the corrected text.
+Narration, one numbered part per line:
+{parts}
+Reply with JSON: {{"fixes": [{{"part": 1, "from": "exact wrong text", "to": "corrected text"}}]}} (empty list when clean)"""
+
+_STOP = {"the", "a", "an", "to", "of", "and", "or", "in", "on", "with", "for", "is", "are", "be", "could", "would", "that",
+         "this", "it", "its", "by", "as", "at", "from", "first", "every", "into", "was", "were", "has", "had"}
+
+
+def _sentences(t):
+    return [s.strip() for s in re.split(r"(?<=[.!?])\s+", str(t).strip()) if s.strip()]
+
+
+def _content(s):
+    return {w for w in re.findall(r"[a-z0-9']+", s.lower()) if w not in _STOP and len(w) > 2}
+
+
+def _nw(s):
+    return len(str(s).split())
+
+
+def _hook_repeat(scenes):
+    """-> (hook, the later sentence it repeats) or None (half or more of the hook's content words shared)."""
+    ss = _sentences(scenes[0]["narration"])
+    if not ss:
+        return None
+    hook, hw = ss[0], _content(ss[0])
+    if len(hw) < 3:
+        return None
+    later = ss[1:] + [x for s in scenes[1:] for x in _sentences(s["narration"])]
+    best = max(later, key=lambda x: len(hw & _content(x)) / len(hw), default=None)
+    return (hook, best) if best and len(hw & _content(best)) / len(hw) >= 0.5 else None
+
+
+_NUMW = ("zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen "
+         "seventeen eighteen nineteen twenty thirty forty fifty sixty seventy eighty ninety hundred thousand million "
+         "billion trillion half quarter").split()
+
+
+def _numbers(s):
+    """The numbers a sentence states - digits and spelled-out number words."""
+    t = s.lower()
+    return set(re.findall(r"\d[\d.,]*", t)) | {w for w in re.findall(r"[a-z]+", t) if w in _NUMW}
+
+
+def _bad_numbers(hook, rest):
+    """Numbers in the hook that the rest of the narration never states (a hook may only use the video's own facts)."""
+    return _numbers(hook) - _numbers(rest)
+
+
+def polish(p):
+    """Hook check -> fresh hook if it repeats a later line -> proofread. Each step is skipped (logged) if it fails."""
+    scenes, title = p["scenes"], str(p.get("title") or "")
+    body = " ".join(s["narration"] for s in scenes)[:12000].replace('"', "'")
+    ss0 = _sentences(scenes[0]["narration"])
+    first = (ss0 or [""])[0]
+    rest_text = " ".join(ss0[1:] + [s["narration"] for s in scenes[1:]])
+    # 2026-11-22: the planner's own opener said "Two meters separate fifth place from history" while the narration says
+    # zero point nine metres - an opener with a number the narration never states is dropped and replaced
+    bad = _bad_numbers(first, rest_text)
+    if bad and len(ss0) > 1:
+        scenes[0]["narration"] = " ".join(ss0[1:])
+        log(f"opening line dropped - it states numbers the narration never does ({', '.join(sorted(bad))}): {first}")
+        first = ss0[1]
+    try:
+        j = _json_of(ask(HOOK_CHECK.format(first=first.replace('"', "'"), title=title.replace('"', "'"), body=body),
+                         system="You judge and write cold-open hooks for videos. Reply with JSON only.", max_tokens=3000))
+        h = str(j.get("hook") or "").strip()
+        if j.get("is_hook") is True:
+            log(f"hook check: the opening is a hook ({str(j.get('why') or '')[:60]})")
+        elif 6 <= _nw(h) <= 30 and not re.search(r"tariq|hasnain", h, re.I) and not _bad_numbers(h, body):
+            scenes[0]["narration"] = h + " " + scenes[0]["narration"]
+            log(f"hook added ({str(j.get('why') or '')[:50]}): {h}")
+        elif h:
+            log(f"hook proposal refused (numbers not in the narration: {sorted(_bad_numbers(h, body))}): {h}")
+    except Exception as e:
+        log(f"hook check skipped ({str(e)[:100]})")
+    rep = _hook_repeat(scenes)
+    if rep:
+        try:
+            j = _json_of(ask(FRESH_HOOK.format(hook=rep[0].replace('"', "'"), later=rep[1].replace('"', "'"),
+                                               title=title.replace('"', "'"), body=body),
+                             system="You write cold-open hooks for video essays. Reply with JSON only.", max_tokens=3000))
+            h = str(j.get("hook") or "").strip()
+            rest = _sentences(scenes[0]["narration"])[1:]
+            if 6 <= _nw(h) <= 30 and not _hook_repeat([dict(scenes[0], narration=" ".join([h] + rest))] + scenes[1:]):
+                scenes[0]["narration"] = " ".join([h] + rest)
+                log(f"hook repeated a later line - rewritten: {h}")
+            else:
+                log("hook repeats a later line and no fresh one passed - kept")
+        except Exception as e:
+            log(f"fresh hook skipped ({str(e)[:100]})")
+    try:
+        import difflib
+        parts = "\n".join(f"{i + 1}. {s['narration']}" for i, s in enumerate(scenes))
+        j = _json_of(ask(PROOF.format(parts=parts[:60000]), system="You are a meticulous proofreader. Reply with JSON only.",
+                         max_tokens=6000))
+        done = []
+        for f in j.get("fixes") or []:
+            try:
+                i, a, b = int(f.get("part")) - 1, str(f.get("from") or ""), str(f.get("to") or "")
+            except (TypeError, ValueError):
+                continue
+            n = scenes[i]["narration"] if 0 <= i < len(scenes) else ""
+            if not a or a == b or n.count(a) != 1 or len(a) > 60 or abs(len(a) - len(b)) > 12 \
+                    or difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio() < 0.6:
+                continue   # only small exact fixes; anything that rewords is refused
+            scenes[i]["narration"] = n.replace(a, b, 1)
+            done.append(f"{a} -> {b}")
+        log(f"proofread: {len(done)} fix(es)" + (": " + "; ".join(done)[:300] if done else " (clean)"))
+    except Exception as e:
+        log(f"proofread skipped ({str(e)[:100]})")
+    return p
+
+
 def _slug(text):
     return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")[:40] or "topic"
 
@@ -223,7 +378,7 @@ def cmd_plan(topic_file, minutes, target, allow_video=True):
     used, daily = veo_today(target)
     slots = max(0, daily - used) if allow_video else 0
     log(f"Veo clips today: {used} of {daily} used - this video may use up to {slots}")
-    p = plan(topic, minutes, target)
+    p = polish(plan(topic, minutes, target))
     text, video = script_from_plan(p, slots)
     p["veo_scenes"] = [i + 1 for i in video]
     t = Path(target)
@@ -539,8 +694,11 @@ def cmd_visuals(target):
     tmp.mkdir(exist_ok=True)
     used, daily = veo_today(t)
     log(f"visuals: {len(rows)} scenes; Veo today {used} of {daily}")
+    ladder = {}   # per beat: what each rung tried and which one fired (the review page shows it above the scrubber)
     for s in rows:
         n, i = s["n"], s["n"] - 1
+        vl.TRACE = []                 # a fresh list per beat; visual_ladder.log appends to the current one
+        ladder[n] = {"tried": vl.TRACE}
         sc = dict(p["scenes"][i]) if i < len(p["scenes"]) else {}
         sc.update(narration=s["narration"], visual=s["prompt"])
         if fg._is_fresh(meta, t, s["asset"], s["hash"]):
@@ -616,6 +774,10 @@ def cmd_visuals(target):
                 log(f"[{s['n']:02d}] stand-in failed: {str(e)[:100]}")
     fg._save_meta(t, meta)
     rows = write_storyboard(text, t)
+    for s in rows:   # which rung fired for each beat (Flow and the stand-in included)
+        src = (meta.get(s["asset"]) or {}).get("source", "missing")
+        ladder.setdefault(s["n"], {"tried": []})["fired"] = src
+    (t / "ladder.json").write_text(json.dumps({str(k): v for k, v in sorted(ladder.items())}, indent=1), encoding="utf-8")
     (t / "credits.txt").write_text("\n".join(dict.fromkeys(credits)) + ("\n" if credits else ""), encoding="utf-8")
     by_src = {}
     for s in rows:
