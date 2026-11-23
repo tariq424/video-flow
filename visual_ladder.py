@@ -80,10 +80,14 @@ def check(image_path, narration, shot=""):
     """-> (ok, reason). Fails closed: a picture that cannot be described or judged is not used."""
     try:
         b64 = base64.b64encode(Path(image_path).read_bytes()).decode()
-        r = requests.post(OLLAMA + "/api/chat", timeout=240, json={
-            "model": VISION_MODEL, "stream": False, "keep_alive": "5m",
-            "messages": [{"role": "user", "content": DESCRIBE, "images": [b64]}],
-            "options": {"temperature": 0.1, "num_predict": 160}})
+        # GPU interlock (owner, 2026-11-23): the shared GPU lock (Video Studio's) is held only for this one look, and
+        # keep_alive 0 makes Ollama unload the model as soon as it answers - the VRAM is free again when the lock is.
+        import interlock
+        with interlock.gpu("vision check (%s)" % Path(image_path).name):
+            r = requests.post(OLLAMA + "/api/chat", timeout=240, json={
+                "model": VISION_MODEL, "stream": False, "keep_alive": 0,
+                "messages": [{"role": "user", "content": DESCRIBE, "images": [b64]}],
+                "options": {"temperature": 0.1, "num_predict": 160}})
         txt = r.json()["message"]["content"]
         j = json.loads(txt[txt.find("{"):txt.rfind("}") + 1])
     except Exception as e:

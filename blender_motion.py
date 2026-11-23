@@ -437,22 +437,30 @@ def render_blender_storyboard(scenes, timeline_out, width=1920, height=1080, fps
               ", ".join(f"{s['n']}:{s['shot']}" for s in cfg_scenes))
         print(f"blender: {len(cfg_scenes)} sub-shot(s), {total_frames} frames "
               f"@ {fps}fps ({total_frames / fps:.2f}s)")
-        proc = subprocess.Popen(
-            [blender, "-b", "--python", bpy_path, "--", cfg_path],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            cwd=out_dir, text=True, encoding="utf-8", errors="replace")
+        import interlock   # the shared GPU lock (Video Studio's) for this render only; Blender's exit frees the VRAM
+        gpu = interlock.gpu("Blender render, %d shot(s)" % len(cfg_scenes), log=lambda m: print("blender: " + m, flush=True))
         done_scenes = 0
-        for line in proc.stdout:
-            line = line.rstrip()
-            if line.startswith("BLENDER_SCENE_DONE"):
-                done_scenes += 1
-                print(f"blender: shot {line.split()[1]} rendered "
-                      f"({done_scenes}/{len(cfg_scenes)})", flush=True)
-            elif line.startswith("BLENDER_FRAMING"):
-                print("blender: framing " + line.split(" ", 2)[2], flush=True)
-            elif line.startswith("Fra:"):
-                continue                  # per-frame spam - keep the log tight
-        proc.wait()
+        with gpu:
+            proc = subprocess.Popen(
+                [blender, "-b", "--python", bpy_path, "--", cfg_path],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                cwd=out_dir, text=True, encoding="utf-8", errors="replace")
+            try:
+                for line in proc.stdout:
+                    line = line.rstrip()
+                    if line.startswith("BLENDER_SCENE_DONE"):
+                        done_scenes += 1
+                        print(f"blender: shot {line.split()[1]} rendered "
+                              f"({done_scenes}/{len(cfg_scenes)})", flush=True)
+                    elif line.startswith("BLENDER_FRAMING"):
+                        print("blender: framing " + line.split(" ", 2)[2], flush=True)
+                    elif line.startswith("Fra:"):
+                        continue                  # per-frame spam - keep the log tight
+                proc.wait()
+            finally:
+                if proc.poll() is None:   # never release the GPU while our Blender still runs on it
+                    proc.kill()
+                    proc.wait()
         if proc.returncode != 0:
             raise RuntimeError(f"blender exited {proc.returncode} "
                                f"({done_scenes}/{len(cfg_scenes)} shots rendered)")
