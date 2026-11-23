@@ -173,17 +173,19 @@ def render_3d_orbit(glb_path, bg_image, out_mp4, duration_s,
     with open(bpy_path, "w", encoding="utf-8") as f:
         f.write(BPY_TEMPLATE)
 
-    proc = subprocess.Popen(
-        [blender, "-b", "--python", bpy_path, "--", cfg_path],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        cwd=out_dir, text=True, encoding="utf-8", errors="replace")
-    tail = []
-    for line in proc.stdout:
-        line = line.rstrip()
-        tail = (tail + [line])[-15:]
-        if line.startswith(("ORBIT_", "Error", "Traceback")):
-            print(f"blender-3d: {line[:160]}", flush=True)
-    proc.wait()
+    import interlock   # the shared GPU lock (Video Studio's) for this orbit render only
+    with interlock.gpu("Blender 3D orbit", log=lambda m: print("blender-3d: " + m, flush=True)):
+        proc = subprocess.Popen(
+            [blender, "-b", "--python", bpy_path, "--", cfg_path],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            cwd=out_dir, text=True, encoding="utf-8", errors="replace")
+        tail = []
+        for line in proc.stdout:
+            line = line.rstrip()
+            tail = (tail + [line])[-15:]
+            if line.startswith(("ORBIT_", "Error", "Traceback")):
+                print(f"blender-3d: {line[:160]}", flush=True)
+        proc.wait()
     if proc.returncode != 0 or not any(l.startswith("ORBIT_DONE") for l in tail):
         raise RuntimeError(f"orbit render failed (rc={proc.returncode}): "
                            + " | ".join(tail[-6:])[:400])

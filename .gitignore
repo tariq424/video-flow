@@ -34,3 +34,6 @@ meshes/
 # --- depth model for parallax (depth_layers.py downloads it) ---
 models/
 remotion/film_props_*.json
+
+# interlock lock files (interlock.py)
+.locks/

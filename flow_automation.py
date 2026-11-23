@@ -38,6 +38,7 @@ import random
 import base64
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import requests
@@ -205,15 +206,46 @@ def cdp_alive(timeout_s=3):
         return False
 
 
-def attach_or_launch(onscreen=True):
+_FLOW_LOCK = None
+
+
+def claim_flow(desc=None, wait=True):
+    """Take the machine-wide Flow-browser interlock for this process (see interlock.py): one driver of the Flow
+    browser at a time. Waits (logging who holds it) unless wait=False, then raises Blocker. A subprocess frees it on
+    exit; a long-lived process (the factory server) calls release_flow() when done."""
+    global _FLOW_LOCK
+    if _FLOW_LOCK is not None and _FLOW_LOCK.held:
+        return
+    import interlock
+    lk = interlock.Lock("flow")
+    desc = desc or "flow: " + " ".join(os.path.basename(a) for a in sys.argv[:2])
+    ok = lk.acquire(desc, wait=wait, on_wait=lambda m: log(
+        f"waiting for the Flow browser: in use by {interlock.describe(m)}; continuing when it is free"))
+    if not ok:
+        raise Blocker("the Flow browser is busy: " + interlock.describe(interlock.holder("flow")))
+    _FLOW_LOCK = lk
+
+
+def release_flow():
+    global _FLOW_LOCK
+    if _FLOW_LOCK is not None:
+        _FLOW_LOCK.release()
+        _FLOW_LOCK = None
+
+
+def attach_or_launch(onscreen=True, lock_desc=None, wait=True, claim=True):
     """Attach to the manual-assist browser - a real Chrome on OUR profile with
     a CDP debug port - or launch it fresh. Returns (pw, ctx, page).
+    Takes the Flow-browser interlock first (claim_flow), so two drivers never share the browser; claim=False only
+    for a caller that already holds its own interlock.Lock("flow") (the factory server's beat editor, per thread).
 
     Unlike open_browser(), the caller must NOT close/stop the result when the
     browser should stay open for the user to work in (manual paste). A
     CDP-attached browser is not a Playwright child, so it survives process
     exit regardless."""
     from playwright.sync_api import sync_playwright
+    if claim:
+        claim_flow(lock_desc, wait)
     if cdp_alive():
         pw = sync_playwright().start()
         ctxb = pw.chromium.connect_over_cdp(CDP_URL)

@@ -8,6 +8,7 @@ Faceless ("headless") videos (owner, 2026-11-22): no person's or owner's name is
 The cards are silent. cards.json (in --target) records their lengths so the beat editor can find every beat's time.
 """
 import json
+import shutil
 import os
 import subprocess
 import sys
@@ -87,8 +88,15 @@ def _probe(path):
     return int(a.get("sample_rate") or 48000), round(int(num) / max(1, int(den)))
 
 
-def add_cards(video, title, still=None, target=None):
+def add_cards(video, title, still=None, target=None, out_path=None):
+    """out_path: write the carded video there and leave `video` untouched (publishing a render that has no cards)."""
     sr, fps = _probe(video)
+    try:
+        dur = float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0",
+                                    str(video)], capture_output=True, text=True).stdout.strip() or 0)
+    except ValueError:
+        dur = 0.0
+    preset = "medium" if dur < 900 else "faster"   # a long film re-encodes in a reasonable time
     tmp = Path(tempfile.mkdtemp(prefix="cards_"))
     title_card(title, still, tmp / "intro.jpg")
     end_card(title, still, tmp / "outro.jpg")
@@ -105,12 +113,12 @@ def add_cards(video, title, still=None, target=None):
            "-f", "lavfi", "-t", str(INTRO_S), "-i", f"anullsrc=r={sr}:cl=stereo",
            "-f", "lavfi", "-t", str(OUTRO_S), "-i", f"anullsrc=r={sr}:cl=stereo",
            "-filter_complex", fc, "-map", "[v]", "-map", "[a]",
-           "-c:v", "libx264", "-crf", "18", "-preset", "medium", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+           "-c:v", "libx264", "-crf", "18", "-preset", preset, "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
            "-movflags", "+faststart", str(out)]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0 or not out.exists():
         raise SystemExit("cards: ffmpeg failed - " + r.stderr[-400:])
-    os.replace(out, video)
+    shutil.move(str(out), str(out_path or video))   # the temp folder may be on another drive
     if target:
         Path(target, "cards.json").write_text(json.dumps({"intro_s": INTRO_S, "outro_s": OUTRO_S, "title": title}),
                                               encoding="utf-8")

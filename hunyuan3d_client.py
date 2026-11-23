@@ -132,10 +132,12 @@ def _via_local(image_path, out_glb, home, timeout_s):
                           "_hy3dgen_run.py")
     cmd = [py, "-u", script, image_path, out_glb, home]
     print(f"hunyuan3d: local -> {home}", flush=True)
+    import interlock   # the shared GPU lock (Video Studio's); the mesh process exits, freeing the VRAM, before release
     try:
-        r = subprocess.run(cmd, cwd=home, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace",
-                           timeout=timeout_s)
+        with interlock.gpu("Hunyuan3D mesh", log=lambda m: print("hunyuan3d: " + m, flush=True)):
+            r = subprocess.run(cmd, cwd=home, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace",
+                               timeout=timeout_s)
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"hunyuan3d local run exceeded {timeout_s}s")
     if r.returncode != 0 or not os.path.isfile(out_glb):
