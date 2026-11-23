@@ -33,8 +33,13 @@ LIC_NAME = {"cc0": "CC0", "pdm": "Public domain", "by": "CC BY", "by-sa": "CC BY
 MIN_W = 1200
 
 
+TRACE = []   # every rung attempt of the current scene ("photo commons: does not fit ..."), read by topic_video
+
+
 def log(msg):
     print(msg, flush=True)
+    if msg.startswith("    "):
+        TRACE.append(msg.strip())
 
 
 def _key(name):
