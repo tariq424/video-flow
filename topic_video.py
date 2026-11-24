@@ -20,6 +20,7 @@ is the factory's own (build_video.py --parallax): stills become Blender camera m
 """
 import datetime
 import json
+import shutil
 import os
 import re
 import sys
@@ -108,7 +109,7 @@ footage, a real photo, or an AI image. Plan ONE video and answer with ONE JSON o
                   "sheet": "a precise visual description used to draw ONE reference image of it"} ],
  "scenes": [ {"visual": "ONE shot, described for an image model", "narration": "the voice-over for this shot",
               "refs": ["Short Name"], "stock": "3-6 word stock-footage search", "photo": "real-photo search or empty",
-              "motion": 0} ]
+              "people": ["Full Name"], "motion": 0} ]
 }
 
 Rules:
@@ -135,6 +136,11 @@ Rules:
 - Faceless ("headless") video: no host and no presenter. Never write "I", "welcome to my channel", "in this video",
   a channel name or the owner's name; the narration speaks about the subject only.
 - Keep pictures safe for an image model: no gore, no weapons aimed at people, never children together with violence.
+- people: the REAL, named people the shot itself shows (e.g. ["James Earl Jones"]); [] when it shows nobody real.
+  Real public photos or footage of them are used when they exist; otherwise they are drawn as an artist's rendition.
+  Put their name in "photo" as well (e.g. "James Earl Jones 1987").
+- Never make a copyrighted character or a film/TV still the picture (Darth Vader, a cartoon lion, a superhero): show
+  a symbolic real-world scene instead (a recording booth, a real lion at dawn).
 - motion: 0-3, how much the moment needs real movement (3 = it only works as moving video). Most scenes are 0 or 1.
 - Facts must be correct. Use the research notes; do not invent statistics, dates or quotes."""
 
@@ -341,6 +347,26 @@ def _refs_of(p, i):
     return [n for n in (p["scenes"][i].get("refs") or []) if n in names]
 
 
+_PHOTO_WORDS = re.compile(r"(?i)\b(a |an )?(real )?(archival |faded |vintage )?(photograph|photo|film still|still)( of)?\b|"
+                          r",?\s*16:9,?\s*photorealistic\.?|photorealistic,?|sepia tone,?")
+
+
+def apply_people(p):
+    """owner, 2026-11-23: a scene showing a REAL, named person keeps its own shot description for judging real photos and
+    footage ("shot"); its picture prompt becomes an artist's rendition (courtroom-sketch style) of that person's look,
+    read from a public photo of them - used only when no real photo or footage fits."""
+    for sc in p.get("scenes") or []:
+        people = [str(x).strip() for x in sc.get("people") or [] if str(x).strip()]
+        if not people or "courtroom-sketch" in str(sc.get("visual")):
+            continue
+        sc["shot"] = sc["visual"]
+        scene = _PHOTO_WORDS.sub(" ", str(sc["visual"]))
+        for name in people:
+            scene = re.sub(re.escape(name) + r"('s)?", "the person", scene)
+        sc["visual"] = vl.sketch_visual(people, " ".join(scene.split()).strip(" ,.") + ".")
+    return p
+
+
 def script_from_plan(p, veo_slots):
     """The factory script (Section 2 template). The top `veo_slots` scenes by motion (>= 2) get [VIDEO]."""
     ranked = sorted(range(len(p["scenes"])), key=lambda i: -int(p["scenes"][i].get("motion") or 0))
@@ -351,7 +377,9 @@ def script_from_plan(p, veo_slots):
         used = _refs_of(p, i)
         if used:
             visual += " (Same " + ", ".join(f"{n} as the reference image '{REF_PREFIX}{n}'" for n in used) + ".)"
-        if "16:9" not in visual:
+        if "courtroom-sketch" in visual:
+            visual += " 16:9."   # an artist's rendition stays a drawing
+        elif "16:9" not in visual:
             visual += " Cinematic, photorealistic, 16:9."
         tag = "[VIDEO] " if i in video else ""
         paras.append(f"{tag}{visual}\nNARRATION: {' '.join(str(s['narration']).split())}")
@@ -378,7 +406,7 @@ def cmd_plan(topic_file, minutes, target, allow_video=True):
     used, daily = veo_today(target)
     slots = max(0, daily - used) if allow_video else 0
     log(f"Veo clips today: {used} of {daily} used - this video may use up to {slots}")
-    p = polish(plan(topic, minutes, target))
+    p = apply_people(polish(plan(topic, minutes, target)))
     text, video = script_from_plan(p, slots)
     p["veo_scenes"] = [i + 1 for i in video]
     t = Path(target)
@@ -424,8 +452,9 @@ REF_PREAMBLE = """Create reference images for a film. Generate exactly ONE separ
 SCENE_PREAMBLE = """Generate exactly ONE separate image for each scene below, in order.
 - This project may contain reference images titled "REF <name>". Whenever a scene says "the reference image
   'REF <name>'", use that image as an ingredient so the person, place or object looks the same.
-- Each scene is an independent 16:9, photorealistic, cinematic shot. NARRATION lines are context only, never text in
-  the picture. No text, captions, letters, logos or watermarks. No collages.
+- Each scene is an independent 16:9, photorealistic, cinematic shot - except a scene that asks for a courtroom-sketch
+  illustration: draw that one exactly as described, as a hand-drawn sketch. NARRATION lines are context only, never text
+  in the picture. No text, captions, letters, logos or watermarks. No collages.
 - Use Nano Banana for every still image. Save each as a separate project asset.
 - Title each generated item with its scene label first, exactly as given, e.g. "S03 harbour at dawn".
 - When done, list each scene with done or failed."""
@@ -599,7 +628,7 @@ def _match(rows, tiles):
             reply = ask("Match generated items to the scenes they were made for. Each item has a short title the image tool"
                         " gave it. Only match an IMAGE to an IMAGE scene and a VIDEO to a VIDEO scene; leave an item or a"
                         " scene unmatched when nothing fits. Answer with a JSON object {\"scene_asset\": \"T<number>\"}.\n\n"
-                        f"ITEMS:\n{listing}\n\nSCENES:\n{scenes}", max_tokens=2000)
+                        f"ITEMS:\n{listing}\n\nSCENES:\n{scenes}", max_tokens=16000)
             for asset, tid in _json_of(reply).items():
                 m = re.match(r"T(\d+)$", str(tid).strip())
                 if m and int(m.group(1)) < len(left_tiles) and asset in {r["asset"] for r in left_rows}:
@@ -610,6 +639,55 @@ def _match(rows, tiles):
         except Exception as e:
             log(f"  title matching failed ({str(e)[:100]})")
     return out
+
+
+def _collect(t, todo, tiles, ctx, page, meta):
+    """Match Flow tiles to the todo scenes and save each matched picture or clip. -> Veo clips saved."""
+    matched = _match(todo, tiles)
+    made_video = 0
+    for r in todo:
+        tile = matched.get(r["asset"])
+        if not tile:
+            continue
+        src = _video_src(page, tile["key"]) if r["mode"] == "video" else tile["key"]
+        data = fa._download(src, ctx, page, "video" if r["mode"] == "video" else "image") if src else None
+        if fg._save_asset(t, meta, r, data, "flow") and r["mode"] == "video":
+            made_video += 1
+    return made_video
+
+
+def reuse_last_project(t, p, rows, meta):
+    """owner, 2026-11-23: a run that stopped after Flow had already made the pictures must not pay for them twice. The
+    last project (topic_flow.json, same day) is opened and its items are matched to the scenes still missing.
+    -> Veo clips saved (pictures are saved into meta)."""
+    rec = json.loads((t / "topic_flow.json").read_text(encoding="utf-8")) if (t / "topic_flow.json").exists() else {}
+    if not rec.get("project") or not str(rec.get("ts", "")).startswith(time.strftime("%Y-%m-%d"))             or rec.get("title") != p.get("title"):   # only this same video's project
+        return 0
+    todo = fg.todo_records(rows)
+    by_n = {s["n"]: s for s in rows}
+    for r in todo:
+        r["prompt"] = by_n[r["n"]]["prompt"]
+    pw, ctx, page = fa.attach_or_launch(onscreen=False)
+    try:
+        log(f"Flow: first taking what the last project already made ({rec['project']})")
+        fa.goto(page, rec["project"])
+        page.wait_for_timeout(8000)
+        tiles = [x for x in _tiles(page) if not str(x.get("label", "")).startswith(REF_PREFIX)]
+        log(f"  {len(tiles)} item(s) in that project")
+        return _collect(t, todo, tiles, ctx, page, meta) if tiles else 0
+    finally:
+        try:
+            ctx.browser.new_browser_cdp_session().send("Browser.close")
+        except Exception:
+            pass
+        try:   # a second Playwright session in this process (run_flow next) needs this one stopped
+            pw.stop()
+        except Exception:
+            pass
+        for _ in range(30):   # and the browser fully closed, or the next connection catches it shutting down
+            if not fa.cdp_alive(timeout_s=1):
+                break
+            time.sleep(1)
 
 
 def run_flow(t, p, rows, meta):
@@ -630,7 +708,8 @@ def run_flow(t, p, rows, meta):
     try:
         project = _new_project(page)
         log(f"Flow project: {project}")
-        (t / "topic_flow.json").write_text(json.dumps({"project": project, "ts": now()}), encoding="utf-8")
+        (t / "topic_flow.json").write_text(json.dumps({"project": project, "ts": now(), "title": p.get("title")}),
+                                           encoding="utf-8")
         if refs:
             msg = REF_PREAMBLE + "\n\n" + "\n\n".join(
                 f"Reference {i}, title \"{REF_PREFIX}{r['name']}\" ({r.get('kind', 'character')}): {r['sheet']}"
@@ -664,17 +743,7 @@ def run_flow(t, p, rows, meta):
             got = _wait_for(page, before, expect, c["wait_minutes_per_message"], msg, video_ok and has_video)
             log(f"Flow scene message {k}: {len(got)} of {expect} item(s) made")
         new = [x for x in _tiles(page) if x["key"] not in baseline]
-        matched = _match(todo, new)
-        made_video = 0
-        for r in todo:
-            tile = matched.get(r["asset"])
-            if not tile:
-                continue
-            src = _video_src(page, tile["key"]) if r["mode"] == "video" else tile["key"]
-            data = fa._download(src, ctx, page, "video" if r["mode"] == "video" else "image") if src else None
-            if fg._save_asset(t, meta, r, data, "flow") and r["mode"] == "video":
-                made_video += 1
-        return made_video
+        return _collect(t, todo, new, ctx, page, meta)
     finally:
         try:   # leave nothing on screen: close the Flow window this run used
             ctx.browser.new_browser_cdp_session().send("Browser.close")
@@ -683,6 +752,15 @@ def run_flow(t, p, rows, meta):
 
 
 # ------------------------------------------------------------------ visuals: ladder first, Flow last
+def _have(meta, t, s):
+    """The scene has its picture or clip for this prompt - real stock footage included (flow_generate's own check
+    counts "stock" as a placeholder still; here stock footage is a real, checked clip)."""
+    if fg._is_fresh(meta, t, s["asset"], s["hash"]):
+        return True
+    rec = meta.get(s["asset"]) or {}
+    return (Path(t) / s["asset"]).is_file() and rec.get("source") == "stock" and rec.get("prompt_hash") == s["hash"]
+
+
 def cmd_visuals(target):
     t = Path(target)
     p = json.loads((t / "topic_plan.json").read_text(encoding="utf-8"))
@@ -701,7 +779,8 @@ def cmd_visuals(target):
         ladder[n] = {"tried": vl.TRACE}
         sc = dict(p["scenes"][i]) if i < len(p["scenes"]) else {}
         sc.update(narration=s["narration"], visual=s["prompt"])
-        if fg._is_fresh(meta, t, s["asset"], s["hash"]):
+        real = dict(sc, visual=sc["shot"]) if sc.get("shot") else sc   # stock and real photos: the shot as written
+        if _have(meta, t, s):
             log(f"[{n:02d}] already has its picture ({(meta.get(s['asset']) or {}).get('source')})")
             continue
         if _refs_of(p, i):
@@ -709,7 +788,7 @@ def cmd_visuals(target):
             flow_n.append(n)
             continue
         log(f"[{n:02d}] {s['narration'][:70]}...")
-        c = vl.stock_video(sc, t / f"scene_{n:02d}.mp4", ask, tmp)
+        c = vl.stock_video(real, t / f"scene_{n:02d}.mp4", ask, tmp)
         if c:
             if s["mode"] != "video":
                 text = _set_video_tag(t, n, True)
@@ -727,7 +806,7 @@ def cmd_visuals(target):
             text = _set_video_tag(t, n, False)
             text, rows_now = _rows(t)
             s = next(r for r in rows_now if r["n"] == n)
-        c = vl.real_photo(sc, t / s["asset"], ask)
+        c = vl.real_photo(real, t / s["asset"], ask)
         if c:
             meta[s["asset"]] = {"prompt_hash": s["hash"], "source": "photo", "ts": now()}
             credits.append(c["credit"])
@@ -747,7 +826,11 @@ def cmd_visuals(target):
         flow_rows = [s for s in rows if s["n"] in flow_n]
         log(f"Flow: {len(flow_rows)} scene(s) of {len(rows)} ({sum(1 for s in flow_rows if s['mode'] == 'video')} Veo)")
         try:
-            made_video = run_flow(t, p, flow_rows, meta)
+            made_video = reuse_last_project(t, p, flow_rows, meta)
+            fg._save_meta(t, meta)   # keep what was taken even if the next step fails
+            flow_rows = [s for s in flow_rows if not _have(meta, t, s)]
+            if flow_rows:
+                made_video += run_flow(t, p, flow_rows, meta)
         except fa.AutomationFlagged as e:
             log("FLOW STOPPED - " + str(e))
         except fa.Blocker as e:
@@ -760,12 +843,18 @@ def cmd_visuals(target):
     # anything still missing: a [VIDEO] scene without a clip becomes a still; every missing still gets Cloudflare
     text, rows = _rows(t)
     for s in rows:
-        if s["mode"] == "video" and not fg._is_fresh(meta, t, s["asset"], s["hash"]):
+        if s["mode"] == "video" and not _have(meta, t, s):
             log(f"[{s['n']:02d}] no clip - becomes a still scene")
             text = _set_video_tag(t, s["n"], False)
     text, rows = _rows(t)
+    for s in rows:   # a scene whose Veo clip never came: its own second still (scene_NNb.jpg) from Flow stands in
+        extra = t / f"scene_{s['n']:02d}b.jpg"
+        if s["mode"] != "video" and not _have(meta, t, s) and extra.is_file() and s["asset"].endswith(".jpg"):
+            shutil.copyfile(extra, t / s["asset"])
+            meta[s["asset"]] = {"prompt_hash": s["hash"], "source": "flow", "ts": now()}
+            log(f"[{s['n']:02d}] uses its second Flow still in place of the clip")
     for s in rows:
-        if not fg._is_fresh(meta, t, s["asset"], s["hash"]):
+        if not _have(meta, t, s):
             try:
                 vl.cloudflare_still(s["prompt"], t / s["asset"], acct)
                 meta[s["asset"]] = {"prompt_hash": s["hash"], "source": "cloudflare-unchecked", "ts": now()}
@@ -784,7 +873,7 @@ def cmd_visuals(target):
         src = (meta.get(s["asset"]) or {}).get("source", "missing")
         by_src[src] = by_src.get(src, 0) + 1
     log(f"visuals by source: {by_src}; Veo clips made: {made_video} (today {veo_today(t)[0]} of {daily})")
-    missing = [s["asset"] for s in rows if not fg._is_fresh(meta, t, s["asset"], s["hash"])]
+    missing = [s["asset"] for s in rows if not _have(meta, t, s)]
     if missing:
         raise SystemExit(f"{len(missing)} scene(s) still have no picture: {missing}")
     log("__VISUALS_DONE__")
