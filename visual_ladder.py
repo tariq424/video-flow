@@ -283,6 +283,79 @@ def real_photo(scene, out_jpg, ask):
     return None
 
 
+# ------------------------------------------------------------------ rung 2b: artist's rendition of a real person
+# owner, 2026-11-23 (as Video Studio does it, our own code): a scene that shows a REAL, named person uses real public
+# footage or photos first. When none fits, the person is drawn as a courtroom-sketch artist's rendition: a public photo
+# of them is described by LOOK only (age, hair, clothing - never who they are), and that look is drawn in the sketch
+# style in the scene where the story happens. Only the drawing style is a courtroom's, never the setting.
+SKETCH = ("A hand-drawn courtroom-sketch-artist illustration, charcoal and soft pastel on cream paper, loose quick strokes, "
+          "visible paper grain, not a photograph. Only the drawing style is a courtroom sketch: the setting is where the "
+          "story happens, never a courtroom, judge or trial.")
+LOOK_ASK = ('Look at the main person in this picture. Describe only lasting physical features, NOT their clothing, age, '
+            'setting or what they are doing. Reply with ONLY JSON: {"person": "yes" or "no", "look": "<under 20 words: '
+            'gender, skin tone, build, face shape, hair texture, facial hair>"}')
+_LOOKS = {}
+
+
+def _person_photos(name, n=10):
+    """Public (CC / public-domain) photos of a named person from Wikimedia Commons - any shape, any size over 300 px."""
+    try:
+        r = requests.get("https://commons.wikimedia.org/w/api.php", headers=UA, timeout=30, params={
+            "action": "query", "format": "json", "generator": "search", "gsrsearch": f"filetype:bitmap {name}",
+            "gsrnamespace": 6, "gsrlimit": n, "prop": "imageinfo", "iiprop": "url|size|extmetadata", "iiurlwidth": 800})
+        out = []
+        for pg in (r.json().get("query", {}).get("pages", {}) or {}).values():
+            ii = (pg.get("imageinfo") or [{}])[0]
+            lic = ((ii.get("extmetadata") or {}).get("LicenseShortName", {}).get("value") or "").lower()
+            title = pg.get("title", "").lower()
+            # only a file NAMED after the person (a search hit on the words alone is often someone else)
+            if all(w.lower() in title for w in name.split()) and (ii.get("width") or 0) >= 300 and                     ("cc" in lic or "public domain" in lic):
+                out.append(ii.get("thumburl") or ii["url"])
+        return out
+    except Exception:
+        return []
+
+
+def person_look(name):
+    """How a real person looks, read from a public photo of them by the local vision model (cached per name). -> '' if
+    no usable photo."""
+    if name in _LOOKS:
+        return _LOOKS[name]
+    look = ""
+    import interlock
+    for url in _person_photos(name)[:5]:
+        try:
+            r = requests.get(url, headers=UA, timeout=60)
+            if r.status_code != 200:
+                continue
+            b64 = base64.b64encode(r.content).decode()
+            with interlock.gpu("vision: look of a person"):
+                rr = requests.post(OLLAMA + "/api/chat", timeout=240, json={
+                    "model": VISION_MODEL, "stream": False, "keep_alive": 0,
+                    "messages": [{"role": "user", "content": LOOK_ASK, "images": [b64]}],
+                    "options": {"temperature": 0.1, "num_predict": 120}})
+            txt = rr.json()["message"]["content"]
+            j = json.loads(txt[txt.find("{"):txt.rfind("}") + 1])
+            if str(j.get("person", "")).lower().startswith("y") and j.get("look"):
+                look = str(j["look"]).strip().rstrip(".")
+                break
+        except Exception:
+            continue
+    _LOOKS[name] = look
+    log(f"    look of {name}: {look or '(no public photo found)'}")
+    return look
+
+
+def sketch_visual(people, scene):
+    """The scene's picture as an artist's rendition of the named people (their looks from public photos)."""
+    looks = []
+    for name in people:
+        lk = re.sub(r"(?i)^(the )?(main )?person (appears to be|is)\s*", "", person_look(name)).strip(" .")
+        looks.append(lk or "a person")
+    who = " and ".join(looks)
+    return f"{SKETCH} The person drawn: {who} (age and clothing as fits the scene's time). Scene: {scene}"
+
+
 # ------------------------------------------------------------------ rung 3: Cloudflare still
 CF_EXHAUSTED = False   # set once Cloudflare says today's free allowance is used: no more calls this run
 
@@ -295,8 +368,10 @@ def cloudflare_still(prompt, out_jpg, account_id):
     tok = keyring.get_password("ExplainerStudio", "cloudflare_api_token")
     if not (account_id and tok):
         raise RuntimeError("Cloudflare account id (topic_config.json) or API token (Credential Manager) missing")
-    p = ("Photorealistic, cinematic wide 16:9 landscape image. " + re.sub(r"\(Same .*?\)", "", prompt).strip()
-         + " No text, letters, logos or watermarks.")
+    body = re.sub(r"\(Same .*?\)", "", prompt).strip()
+    head = ("Wide 16:9 landscape image. " if "courtroom-sketch" in body   # an artist's rendition stays a drawing
+            else "Photorealistic, cinematic wide 16:9 landscape image. ")
+    p = head + body + " No text, letters, logos or watermarks."
     r = requests.post(f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/@cf/black-forest-labs/flux-1-schnell",
                       headers={"Authorization": f"Bearer {tok}"}, json={"prompt": p[:2000], "steps": 8}, timeout=90)
     if r.status_code == 429:

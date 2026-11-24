@@ -79,18 +79,28 @@ def end_card(title, still, out):
 
 
 def _probe(path):
-    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,sample_rate,r_frame_rate",
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,sample_rate,channels,r_frame_rate",
                         "-of", "json", path], capture_output=True, text=True)
     st = json.loads(r.stdout or "{}").get("streams", [])
     a = next((s for s in st if s.get("codec_type") == "audio"), {})
     v = next((s for s in st if s.get("codec_type") == "video"), {})
     num, den = (v.get("r_frame_rate") or "30/1").split("/")
-    return int(a.get("sample_rate") or 48000), round(int(num) / max(1, int(den)))
+    return int(a.get("sample_rate") or 48000), round(int(num) / max(1, int(den))), int(a.get("channels") or 2)
+
+
+def _ff(args, what):
+    r = subprocess.run(["ffmpeg", "-nostdin", "-y", "-v", "error"] + args, capture_output=True, text=True,
+                       stdin=subprocess.DEVNULL)
+    if r.returncode != 0:
+        raise SystemExit(f"cards: ffmpeg failed ({what}) - " + r.stderr[-400:])
 
 
 def add_cards(video, title, still=None, target=None, out_path=None):
-    """out_path: write the carded video there and leave `video` untouched (publishing a render that has no cards)."""
-    sr, fps = _probe(video)
+    """out_path: write the carded video there and leave `video` untouched (publishing a render that has no cards).
+    2026-11-24: one filter graph over five inputs (two looped stills, two silent tracks, the video) deadlocked in
+    ffmpeg 8 at the same frame every time on a 4.7-min video. Now each card is its own short clip in the video's own
+    format, and the three files are joined one after another (the concat demuxer reads them in turn: no deadlock)."""
+    sr, fps, ch = _probe(video)
     try:
         dur = float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0",
                                     str(video)], capture_output=True, text=True).stdout.strip() or 0)
@@ -100,24 +110,24 @@ def add_cards(video, title, still=None, target=None, out_path=None):
     tmp = Path(tempfile.mkdtemp(prefix="cards_"))
     title_card(title, still, tmp / "intro.jpg")
     end_card(title, still, tmp / "outro.jpg")
+    layout = "mono" if ch == 1 else "stereo"
+    enc = ["-c:v", "libx264", "-crf", "18", "-preset", preset, "-pix_fmt", "yuv420p", "-r", str(fps),
+           "-c:a", "aac", "-b:a", "192k", "-ar", str(sr), "-ac", str(ch)]
+    for name, secs, fade in (("intro", INTRO_S, f"fade=t=in:st=0:d=0.6,fade=t=out:st={INTRO_S - 0.4}:d=0.4"),
+                             ("outro", OUTRO_S, "fade=t=in:st=0:d=0.5")):
+        _ff(["-loop", "1", "-t", str(secs), "-i", str(tmp / f"{name}.jpg"),
+             "-f", "lavfi", "-t", str(secs), "-i", f"anullsrc=r={sr}:cl={layout}",
+             "-vf", f"scale={W}:{H},fps={fps},format=yuv420p,{fade},setsar=1", "-shortest"] + enc
+            + [str(tmp / f"{name}.mp4")], name + " card")
+    _ff(["-i", str(video), "-vf", f"scale={W}:{H},fps={fps},format=yuv420p,setsar=1"] + enc + [str(tmp / "main.mp4")],
+        "the video")
+    (tmp / "list.txt").write_text("".join(f"file '{(tmp / n).as_posix()}'\n" for n in ("intro.mp4", "main.mp4", "outro.mp4")),
+                                  encoding="utf-8")
     out = tmp / "with_cards.mp4"
-    fc = (f"[0:v]scale={W}:{H},fps={fps},format=yuv420p,fade=t=in:st=0:d=0.6,fade=t=out:st={INTRO_S - 0.4}:d=0.4,setsar=1[i];"
-          f"[1:v]scale={W}:{H},fps={fps},format=yuv420p,setsar=1[m];"
-          f"[2:v]scale={W}:{H},fps={fps},format=yuv420p,fade=t=in:st=0:d=0.5,setsar=1[o];"
-          f"[3:a]atrim=0:{INTRO_S},asetpts=PTS-STARTPTS[ia];[1:a]aresample={sr},asetpts=PTS-STARTPTS[ma];"
-          f"[4:a]atrim=0:{OUTRO_S},asetpts=PTS-STARTPTS[oa];"
-          f"[i][ia][m][ma][o][oa]concat=n=3:v=1:a=1[v][a]")
-    cmd = ["ffmpeg", "-y", "-v", "error",
-           "-loop", "1", "-t", str(INTRO_S), "-i", str(tmp / "intro.jpg"), "-i", str(video),
-           "-loop", "1", "-t", str(OUTRO_S), "-i", str(tmp / "outro.jpg"),
-           "-f", "lavfi", "-t", str(INTRO_S), "-i", f"anullsrc=r={sr}:cl=stereo",
-           "-f", "lavfi", "-t", str(OUTRO_S), "-i", f"anullsrc=r={sr}:cl=stereo",
-           "-filter_complex", fc, "-map", "[v]", "-map", "[a]",
-           "-c:v", "libx264", "-crf", "18", "-preset", preset, "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
-           "-movflags", "+faststart", str(out)]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0 or not out.exists():
-        raise SystemExit("cards: ffmpeg failed - " + r.stderr[-400:])
+    _ff(["-f", "concat", "-safe", "0", "-i", str(tmp / "list.txt"), "-c", "copy", "-movflags", "+faststart", str(out)],
+        "joining")
+    if not out.exists():
+        raise SystemExit("cards: the joined video was not written")
     shutil.move(str(out), str(out_path or video))   # the temp folder may be on another drive
     if target:
         Path(target, "cards.json").write_text(json.dumps({"intro_s": INTRO_S, "outro_s": OUTRO_S, "title": title}),

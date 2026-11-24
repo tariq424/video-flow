@@ -14,8 +14,8 @@ Library use:
     from tts import synth
     synth(["line one.", "line two."], r"F:...\\narration.mp3")
 
-Default voice: en-US-ChristopherNeural (standard deep male documentary
-voice). Override with the FLOW_TTS_VOICE env var or the CLI argument.
+Default voice: en-US-EricNeural (deep, measured male documentary voice;
+replaces en-US-ChristopherNeural). Override with FLOW_TTS_VOICE or the CLI argument.
 Requires internet (Microsoft's TTS service) and ffmpeg/ffprobe on PATH.
 """
 
@@ -29,7 +29,7 @@ import sys
 import tempfile
 import time
 
-DEFAULT_VOICE = os.environ.get("FLOW_TTS_VOICE", "en-US-ChristopherNeural")
+DEFAULT_VOICE = os.environ.get("FLOW_TTS_VOICE", "en-US-EricNeural")   # owner, 2026-11-23: no longer Christopher
 SILENCE = "[SILENCE]"
 RATE = 24000                       # edge-tts native sample rate (mono)
 
